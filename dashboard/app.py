@@ -330,41 +330,52 @@ def page_eeg_viewer():
     psg_files = sorted(glob.glob(psg_pattern))
 
     if not psg_files:
-        st.error(
-            f"No PSG EDF files found in `data/raw/`.\n\n"
-            f"Looked for: `{psg_pattern}`"
+        demo_mode = True
+        st.warning("⚠️ **Demo Mode Active**: No raw EDF files found in `data/raw/`. Using a pre-extracted sample EEG (100 Hz, Fpz-Cz) for demonstration.")
+    else:
+        demo_mode = False
+
+    if demo_mode:
+        sample_path = os.path.join(os.path.dirname(__file__), "..", "data", "sample", "demo_eeg.npy")
+        if not os.path.exists(sample_path):
+            st.error("Demo sample file not found. Please ensure `data/sample/demo_eeg.npy` exists.")
+            return
+            
+        full_signal = np.load(sample_path)
+        sfreq = 100.0
+        total_seconds = len(full_signal) / sfreq
+        selected_name = "demo_eeg.npy"
+    else:
+        psg_basenames = [os.path.basename(f) for f in psg_files]
+
+        # --- File selector ---
+        st.markdown('<div class="section-header">📂 Select Recording</div>', unsafe_allow_html=True)
+        selected_name = st.selectbox(
+            "PSG recording",
+            options=psg_basenames,
+            index=0,
+            label_visibility="collapsed",
         )
-        return
+        selected_path = psg_files[psg_basenames.index(selected_name)]
 
-    psg_basenames = [os.path.basename(f) for f in psg_files]
+        # --- Load EDF ---
+        try:
+            raw = load_raw_edf(selected_path)
+        except Exception as exc:
+            st.error(f"Failed to read EDF file: {exc}")
+            return
 
-    # --- File selector ---
-    st.markdown('<div class="section-header">📂 Select Recording</div>', unsafe_allow_html=True)
-    selected_name = st.selectbox(
-        "PSG recording",
-        options=psg_basenames,
-        index=0,
-        label_visibility="collapsed",
-    )
-    selected_path = psg_files[psg_basenames.index(selected_name)]
+        # --- Verify Fpz-Cz channel ---
+        if PREFERRED_CHANNEL not in raw.ch_names:
+            st.error(
+                f"Channel **{PREFERRED_CHANNEL}** not found in this recording.\n\n"
+                f"Available channels: {', '.join(raw.ch_names)}"
+            )
+            return
 
-    # --- Load EDF ---
-    try:
-        raw = load_raw_edf(selected_path)
-    except Exception as exc:
-        st.error(f"Failed to read EDF file: {exc}")
-        return
+        sfreq = raw.info["sfreq"]
+        total_seconds = raw.n_times / sfreq
 
-    # --- Verify Fpz-Cz channel ---
-    if PREFERRED_CHANNEL not in raw.ch_names:
-        st.error(
-            f"Channel **{PREFERRED_CHANNEL}** not found in this recording.\n\n"
-            f"Available channels: {', '.join(raw.ch_names)}"
-        )
-        return
-
-    sfreq = raw.info["sfreq"]
-    total_seconds = raw.n_times / sfreq
     total_minutes = total_seconds / 60
     total_hours = total_minutes / 60
 
@@ -422,11 +433,16 @@ def page_eeg_viewer():
     stop_sample = int(end_time * sfreq)
 
     try:
-        # Pick the Fpz-Cz channel and read only the needed segment
-        raw_pick = raw.copy().pick([PREFERRED_CHANNEL])
-        data, times = raw_pick[:, start_sample:stop_sample]
-        eeg_signal = data[0] * 1e6  # Convert V -> uV for readability
-        time_axis = times
+        if demo_mode:
+            data = full_signal[start_sample:stop_sample]
+            eeg_signal = data * 1e6
+            time_axis = np.linspace(start_time, end_time, len(eeg_signal), endpoint=False)
+        else:
+            # Pick the Fpz-Cz channel and read only the needed segment
+            raw_pick = raw.copy().pick([PREFERRED_CHANNEL])
+            data, times = raw_pick[:, start_sample:stop_sample]
+            eeg_signal = data[0] * 1e6  # Convert V -> uV for readability
+            time_axis = times
     except Exception as exc:
         st.error(f"Error reading EEG data: {exc}")
         return
@@ -507,10 +523,11 @@ def page_prediction():
     psg_files = sorted(glob.glob(psg_pattern))
 
     if not psg_files:
-        st.error(f"No PSG EDF files found in `data/raw/`.\n\nLooked for: `{psg_pattern}`")
-        return
-
-    psg_basenames = [os.path.basename(f) for f in psg_files]
+        demo_mode = True
+        st.warning("⚠️ **Demo Mode Active**: No raw EDF files found in `data/raw/`. Using a pre-extracted sample EEG (100 Hz, Fpz-Cz) for demonstration.")
+    else:
+        demo_mode = False
+        psg_basenames = [os.path.basename(f) for f in psg_files]
 
     # --- Load Model ---
     try:
@@ -523,25 +540,37 @@ def page_prediction():
     col_file, col_epoch = st.columns([2, 1])
     
     with col_file:
-        selected_name = st.selectbox("PSG recording", options=psg_basenames, index=0)
-        selected_path = psg_files[psg_basenames.index(selected_name)]
-
-    try:
-        raw = load_raw_edf(selected_path)
-    except Exception as exc:
-        st.error(f"Failed to read EDF file: {exc}")
-        return
-
-    if PREFERRED_CHANNEL not in raw.ch_names:
-        st.error(f"Channel **{PREFERRED_CHANNEL}** not found in this recording.")
-        return
-
-    sfreq = raw.info["sfreq"]
-    if sfreq != 100:
-        st.error(f"Expected 100 Hz sampling rate, got {sfreq} Hz.")
-        return
+        if demo_mode:
+            st.info("Using demo sample file: data/sample/demo_eeg.npy")
+            selected_name = "demo_eeg.npy"
+            
+            sample_path = os.path.join(os.path.dirname(__file__), "..", "data", "sample", "demo_eeg.npy")
+            if not os.path.exists(sample_path):
+                st.error("Demo sample file not found.")
+                return
+            full_signal = np.load(sample_path)
+            sfreq = 100.0
+            total_seconds = len(full_signal) / sfreq
+        else:
+            selected_name = st.selectbox("PSG recording", options=psg_basenames, index=0)
+            selected_path = psg_files[psg_basenames.index(selected_name)]
+            try:
+                raw = load_raw_edf(selected_path)
+            except Exception as exc:
+                st.error(f"Failed to read EDF file: {exc}")
+                return
         
-    total_seconds = raw.n_times / sfreq
+            if PREFERRED_CHANNEL not in raw.ch_names:
+                st.error(f"Channel **{PREFERRED_CHANNEL}** not found in this recording.")
+                return
+        
+            sfreq = raw.info["sfreq"]
+            if sfreq != 100:
+                st.error(f"Expected 100 Hz sampling rate, got {sfreq} Hz.")
+                return
+                
+            total_seconds = raw.n_times / sfreq
+
     total_epochs = int(total_seconds // 30)
 
     with col_epoch:
@@ -554,9 +583,12 @@ def page_prediction():
 
     # Read exactly one 30-second epoch
     try:
-        raw_pick = raw.copy().pick([PREFERRED_CHANNEL])
-        data, times = raw_pick[:, start_sample:stop_sample]
-        eeg_signal = data[0]
+        if demo_mode:
+            eeg_signal = full_signal[start_sample:stop_sample]
+        else:
+            raw_pick = raw.copy().pick([PREFERRED_CHANNEL])
+            data, times = raw_pick[:, start_sample:stop_sample]
+            eeg_signal = data[0]
     except Exception as exc:
         st.error(f"Error reading EEG data: {exc}")
         return
@@ -669,10 +701,11 @@ def page_hypnogram():
     psg_files = sorted(glob.glob(psg_pattern))
 
     if not psg_files:
-        st.error(f"No PSG EDF files found in `data/raw/`.\n\nLooked for: `{psg_pattern}`")
-        return
-
-    psg_basenames = [os.path.basename(f) for f in psg_files]
+        demo_mode = True
+        st.warning("⚠️ **Demo Mode Active**: No raw EDF files found in `data/raw/`. Using a pre-extracted sample EEG (100 Hz, Fpz-Cz) for demonstration.")
+    else:
+        demo_mode = False
+        psg_basenames = [os.path.basename(f) for f in psg_files]
 
     # --- Load Model ---
     try:
@@ -682,26 +715,38 @@ def page_hypnogram():
         return
 
     st.markdown('<div class="section-header">📂 Select Recording</div>', unsafe_allow_html=True)
-    selected_name = st.selectbox("PSG recording", options=psg_basenames, index=0)
-    selected_path = psg_files[psg_basenames.index(selected_name)]
+    if demo_mode:
+        st.info("Using demo sample file: data/sample/demo_eeg.npy")
+        selected_name = "demo_eeg.npy"
+    else:
+        selected_name = st.selectbox("PSG recording", options=psg_basenames, index=0)
+        selected_path = psg_files[psg_basenames.index(selected_name)]
     
     if st.button("Generate Hypnogram", type="primary"):
         with st.spinner("Processing recording and running inference..."):
             try:
-                raw = load_raw_edf(selected_path)
-                if PREFERRED_CHANNEL not in raw.ch_names:
-                    st.error(f"Channel **{PREFERRED_CHANNEL}** not found.")
-                    return
-                
-                sfreq = raw.info["sfreq"]
-                if sfreq != 100:
-                    st.error(f"Expected 100 Hz sampling rate, got {sfreq} Hz.")
-                    return
-                
-                # Load data
-                raw_pick = raw.copy().pick([PREFERRED_CHANNEL])
-                raw_pick.load_data()
-                data = raw_pick.get_data()[0]
+                if demo_mode:
+                    sample_path = os.path.join(os.path.dirname(__file__), "..", "data", "sample", "demo_eeg.npy")
+                    if not os.path.exists(sample_path):
+                        st.error("Demo sample file not found.")
+                        return
+                    data = np.load(sample_path)
+                else:
+                    raw = load_raw_edf(selected_path)
+                    if PREFERRED_CHANNEL not in raw.ch_names:
+                        st.error(f"Channel **{PREFERRED_CHANNEL}** not found.")
+                        return
+                    
+                    sfreq = raw.info["sfreq"]
+                    if sfreq != 100:
+                        st.error(f"Expected 100 Hz sampling rate, got {sfreq} Hz.")
+                        return
+                    
+                    # Load data
+                    raw_pick = raw.copy().pick([PREFERRED_CHANNEL])
+                    raw_pick.load_data()
+                    data = raw_pick.get_data()[0]
+                    
                 total_samples = len(data)
                 
                 epoch_samples = 3000
