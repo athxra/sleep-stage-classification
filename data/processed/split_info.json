@@ -1,0 +1,36 @@
+{
+  "strategy": "subject-independent (LOSO)",
+  "train": {
+    "subjects": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "files": [
+      "SC4001E0-PSG.edf",
+      "SC4002E0-PSG.edf",
+      "SC4011E0-PSG.edf",
+      "SC4012E0-PSG.edf"
+    ],
+    "n_epochs": 11129
+  },
+  "val": {
+    "subjects": [
+      4
+    ],
+    "files": [
+      "SC4021E0-PSG.edf"
+    ],
+    "n_epochs": 2804
+  },
+  "test": {
+    "subjects": [
+      5
+    ],
+    "files": [
+      "SC4022E0-PSG.edf"
+    ],
+    "n_epochs": 2755
+  }
+}

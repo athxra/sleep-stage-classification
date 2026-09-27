@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Raw Sleep-EDF recordings
+data/raw/*.edf
+
+# Processed dataset arrays
+data/processed/*.npy
+
+# Training outputs
+outputs/
+models/training_history.npz
+
+# Streamlit cache
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
