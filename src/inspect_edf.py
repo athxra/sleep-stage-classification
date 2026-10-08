@@ -4,21 +4,30 @@ inspect_edf.py
 Inspect the raw Sleep-EDF PSG and Hypnogram EDF files.
 
 Usage:
-    python src/inspect_edf.py
+    python src/inspect_edf.py [RECORDING]      e.g. SC4001 (default)
 """
 
+import glob
 import os
+import sys
+
 import mne
 
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
-PSG_FILE = os.path.join(DATA_DIR, "SC4001E0-PSG.edf")
-HYPNO_FILE = os.path.join(DATA_DIR, "SC4001EC-Hypnogram.edf")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from src.config import CHANNEL as PREFERRED_CHANNEL
+from src.config import RAW_DIR
 
-PREFERRED_CHANNEL = "EEG Fpz-Cz"
+
+def find_files(key: str):
+    """PSG and hypnogram paths for a recording key such as 'SC4001'."""
+    psg = glob.glob(os.path.join(RAW_DIR, f"{key}*-PSG.edf"))
+    hyp = glob.glob(os.path.join(RAW_DIR, f"{key}*-Hypnogram.edf"))
+    return (psg[0] if psg else os.path.join(RAW_DIR, f"{key}E0-PSG.edf"),
+            hyp[0] if hyp else os.path.join(RAW_DIR, f"{key}-Hypnogram.edf"))
 
 
 def inspect_psg(filepath: str) -> None:
@@ -102,11 +111,12 @@ def inspect_hypnogram(filepath: str) -> None:
 
 
 def main() -> None:
+    PSG_FILE, HYPNO_FILE = find_files(sys.argv[1] if len(sys.argv) > 1 else "SC4001")
     # Verify files exist before attempting to load
     for tag, path in [("PSG", PSG_FILE), ("Hypnogram", HYPNO_FILE)]:
         if not os.path.isfile(path):
             print(f"ERROR: {tag} file not found at:\n  {os.path.abspath(path)}")
-            print("Please place the Sleep-EDF files in data/raw/ and retry.")
+            print("Run `python src/download_data.py` to fetch the Sleep-EDF files.")
             return
 
     inspect_psg(PSG_FILE)

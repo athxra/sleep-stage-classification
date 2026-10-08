@@ -1,422 +1,160 @@
 """
 preprocess.py
 =============
-Preprocess ALL Sleep-EDF PSG + Hypnogram file pairs into labelled 30-second
-EEG epochs with subject tracking and subject-independent data splitting.
+Preprocess every Sleep-EDF (PSG, Hypnogram) pair in data/raw/ into labelled
+30-second EEG epochs with subject tracking and subject-grouped splits.
 
 Steps:
-  1. Iterate over every (PSG, Hypnogram) pair in data/raw/.
-  2. Extract the Fpz-Cz EEG channel (100 Hz).
-  3. Load hypnogram annotations and expand into 30-second epochs.
-  4. Map sleep-stage labels to 5 classes (Wake, N1, N2, N3, REM).
-  5. Discard unknown ("Sleep stage ?") and "Movement time" epochs.
+  1. Discover every SC4xxx PSG file in data/raw/ and pair it with its hypnogram.
+  2. Extract the Fpz-Cz EEG channel (100 Hz) and cut it into 30-s epochs.
+  3. Label each epoch from the hypnogram; merge S3+S4 -> N3 (AASM).
+  4. Discard unscored epochs ("Sleep stage ?", "Movement time").
+  5. Keep the sleep period plus 30 min of Wake on each side.
   6. Apply per-epoch Z-score normalization.
-  7. Save epochs (X), labels (y), and subject IDs as .npy files.
-  8. Create a subject-independent train / val / test split.
+  7. Save epochs, labels, subject / recording IDs and epoch positions.
+  8. Build subject-grouped cross-validation folds (both nights of a subject
+     always stay in the same split).
 
 Usage:
-    python src/preprocess.py
+    python src/preprocess.py [--folds 5] [--val-subjects 2]
 """
 
-import os
+import argparse
+import glob
 import json
+import os
+import sys
+
 import numpy as np
-import mne
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from src.config import (CLASS_NAMES, PROC_DIR, RAW_DIR, WAKE_EDGE_MIN,
+                        parse_recording, recording_key)
+from src.signals import (UNSCORED, labels_on_grid, load_fpz_cz, segment_epochs,
+                         sleep_period_mask, zscore_epochs)
+from src.splits import make_folds
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
-OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
-
-# Each entry: (subject_id, PSG filename, Hypnogram filename)
-SUBJECTS = [
-    (0, "SC4001E0-PSG.edf", "SC4001EC-Hypnogram.edf"),
-    (1, "SC4002E0-PSG.edf", "SC4002EC-Hypnogram.edf"),
-    (2, "SC4011E0-PSG.edf", "SC4011EH-Hypnogram.edf"),
-    (3, "SC4012E0-PSG.edf", "SC4012EC-Hypnogram.edf"),
-    (4, "SC4021E0-PSG.edf", "SC4021EH-Hypnogram.edf"),
-    (5, "SC4022E0-PSG.edf", "SC4022EJ-Hypnogram.edf"),
-]
-
-CHANNEL = "EEG Fpz-Cz"
-SFREQ = 100          # Hz
-EPOCH_SEC = 30       # seconds
-EPOCH_SAMPLES = SFREQ * EPOCH_SEC   # 3000
-
-# Label mapping: annotation description -> class name
-LABEL_MAP = {
-    "Sleep stage W": "Wake",
-    "Sleep stage 1": "N1",
-    "Sleep stage 2": "N2",
-    "Sleep stage 3": "N3",
-    "Sleep stage 4": "N3",   # AASM: merge S3+S4 -> N3
-    "Sleep stage R": "REM",
-}
-
-# Integer encoding
-CLASS_TO_INT = {
-    "Wake": 0,
-    "N1":   1,
-    "N2":   2,
-    "N3":   3,
-    "REM":  4,
-}
-
-INT_TO_CLASS = {v: k for k, v in CLASS_TO_INT.items()}
-
-# Subject-independent split assignment
-#   Train : 4 subjects
-#   Val   : 1 subject (completely held out)
-#   Test  : 1 subject (completely held out)
-SPLIT_ASSIGNMENT = {
-    0: "train",    # SC4001
-    1: "train",    # SC4002
-    2: "train",    # SC4011
-    3: "train",    # SC4012
-    4: "val",      # SC4021 — validation subject
-    5: "test",     # SC4022 — test subject (unseen)
-}
-
-
-# ---------------------------------------------------------------------------
-# Process a single subject
-# ---------------------------------------------------------------------------
-def process_subject(subject_id: int, psg_path: str, hypno_path: str):
-    """Return (epochs, labels, subject_ids, discard_info) for one subject."""
-
-    print(f"  Loading PSG  : {os.path.basename(psg_path)}")
-    raw = mne.io.read_raw_edf(psg_path, preload=True, verbose=False)
-    raw.pick([CHANNEL])
-
-    sfreq = raw.info["sfreq"]
-    assert sfreq == SFREQ, f"Expected {SFREQ} Hz, got {sfreq} Hz"
-
-    eeg_data = raw.get_data()[0]          # (n_samples,)
-    total_samples = len(eeg_data)
-
-    print(f"  Loading Hyp  : {os.path.basename(hypno_path)}")
-    annotations = mne.read_annotations(hypno_path)
-
-    epochs_list = []
-    labels_list = []
-    discard_info = {}   # description -> epoch count
-    skipped_boundary = 0
-
-    for ann_idx in range(len(annotations)):
-        onset = annotations.onset[ann_idx]
-        duration = annotations.duration[ann_idx]
-        description = annotations.description[ann_idx]
-        n_epochs_in_ann = int(duration // EPOCH_SEC)
-
-        if description not in LABEL_MAP:
-            discard_info[description] = discard_info.get(description, 0) + n_epochs_in_ann
+def discover_recordings(raw_dir: str = RAW_DIR):
+    """Return a sorted list of (psg_path, hypnogram_path) pairs."""
+    hypnos = {recording_key(p): p for p in glob.glob(os.path.join(raw_dir, "SC4*-Hypnogram.edf"))}
+    pairs = []
+    for psg in sorted(glob.glob(os.path.join(raw_dir, "SC4*-PSG.edf"))):
+        hyp = hypnos.get(recording_key(psg))
+        if hyp is None:
+            print(f"  WARNING: no hypnogram for {os.path.basename(psg)}, skipping.")
             continue
-
-        label_int = CLASS_TO_INT[LABEL_MAP[description]]
-
-        for i in range(n_epochs_in_ann):
-            epoch_start_sec = onset + i * EPOCH_SEC
-            start_sample = int(epoch_start_sec * sfreq)
-            end_sample = start_sample + EPOCH_SAMPLES
-
-            if end_sample > total_samples:
-                skipped_boundary += 1
-                continue
-
-            epochs_list.append(eeg_data[start_sample:end_sample])
-            labels_list.append(label_int)
-
-    X = np.array(epochs_list, dtype=np.float32)
-    y = np.array(labels_list, dtype=np.int64)
-    sids = np.full(len(y), subject_id, dtype=np.int64)
-
-    print(f"  Epochs       : {len(X)}  "
-          f"(discarded={sum(discard_info.values())}, boundary={skipped_boundary})")
-
-    return X, y, sids, discard_info
+        pairs.append((psg, hyp))
+    return pairs
 
 
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
-def preprocess() -> None:
-    os.makedirs(OUT_DIR, exist_ok=True)
+def process_recording(psg_path: str, hypno_path: str):
+    """Return (X, y, epoch_index, stats) for one recording."""
+    import mne
 
-    all_X, all_y, all_sids = [], [], []
-    all_discard = {}   # subject_id -> {desc: count}
+    signal = load_fpz_cz(psg_path)
+    epochs = segment_epochs(signal)
+    labels = labels_on_grid(mne.read_annotations(hypno_path), len(epochs))
 
-    print("=" * 60)
-    print("PROCESSING ALL SUBJECTS")
-    print("=" * 60)
+    keep = sleep_period_mask(labels) & (labels != UNSCORED)
+    stats = {
+        "grid_epochs": int(len(labels)),
+        "unscored": int((labels == UNSCORED).sum()),
+        "trimmed_wake": int(((labels == 0) & ~sleep_period_mask(labels)).sum()),
+        "kept": int(keep.sum()),
+    }
+    epoch_index = np.flatnonzero(keep)
+    return zscore_epochs(epochs[keep]), labels[keep], epoch_index, stats
 
-    for subject_id, psg_name, hypno_name in SUBJECTS:
-        psg_path = os.path.join(DATA_DIR, psg_name)
-        hypno_path = os.path.join(DATA_DIR, hypno_name)
 
-        # Verify files exist
-        missing = False
-        for tag, path in [("PSG", psg_path), ("Hypnogram", hypno_path)]:
-            if not os.path.isfile(path):
-                print(f"\n  ERROR: {tag} file not found: {os.path.abspath(path)}")
-                print(f"  Skipping subject {subject_id}.\n")
-                missing = True
-                break
-        if missing:
-            continue
+def print_distribution(title: str, y: np.ndarray) -> None:
+    counts = np.bincount(y, minlength=len(CLASS_NAMES))
+    parts = [f"{name} {c:5d} ({100 * c / max(len(y), 1):4.1f}%)"
+             for name, c in zip(CLASS_NAMES, counts)]
+    print(f"  {title:<8s} n={len(y):6d} | " + " | ".join(parts))
 
-        print(f"\n--- Subject {subject_id} ({psg_name}) ---")
-        X, y, sids, disc = process_subject(subject_id, psg_path, hypno_path)
+
+def preprocess(n_folds: int = 5, n_val_subjects: int = 2) -> None:
+    os.makedirs(PROC_DIR, exist_ok=True)
+    pairs = discover_recordings()
+    if not pairs:
+        raise SystemExit(f"No Sleep-EDF files found in {RAW_DIR}. "
+                         f"Run `python src/download_data.py` first.")
+
+    print("=" * 70)
+    print(f"PROCESSING {len(pairs)} RECORDINGS  (Wake edge = {WAKE_EDGE_MIN} min)")
+    print("=" * 70)
+
+    all_X, all_y, all_sub, all_rec, all_idx = [], [], [], [], []
+    recordings = []
+    for rec_id, (psg, hyp) in enumerate(pairs):
+        subject, night = parse_recording(psg)
+        X, y, idx, stats = process_recording(psg, hyp)
+        print(f"  {os.path.basename(psg):<20s} subject {subject:2d} night {night} | "
+              f"grid {stats['grid_epochs']:5d}  unscored {stats['unscored']:4d}  "
+              f"trimmed-wake {stats['trimmed_wake']:5d}  kept {stats['kept']:5d}")
         all_X.append(X)
         all_y.append(y)
-        all_sids.append(sids)
-        all_discard[subject_id] = disc
+        all_sub.append(np.full(len(y), subject, dtype=np.int64))
+        all_rec.append(np.full(len(y), rec_id, dtype=np.int64))
+        all_idx.append(idx.astype(np.int64))
+        recordings.append({
+            "id": rec_id, "psg": os.path.basename(psg), "hypnogram": os.path.basename(hyp),
+            "subject": subject, "night": night, **stats,
+        })
 
-    # Concatenate across subjects
-    X = np.concatenate(all_X, axis=0)
-    y = np.concatenate(all_y, axis=0)
-    subject_ids = np.concatenate(all_sids, axis=0)
+    X = np.concatenate(all_X)
+    y = np.concatenate(all_y)
+    subject_ids = np.concatenate(all_sub)
+    recording_ids = np.concatenate(all_rec)
+    epoch_index = np.concatenate(all_idx)
 
-    # ------------------------------------------------------------------
-    # Discarded annotations summary
-    # ------------------------------------------------------------------
     print()
-    print("=" * 60)
-    print("DISCARDED ANNOTATIONS SUMMARY")
-    print("=" * 60)
+    print_distribution("Overall", y)
 
-    for subject_id, psg_name, _ in SUBJECTS:
-        if subject_id not in all_discard:
-            continue
-        disc = all_discard[subject_id]
-        if disc:
-            for desc, count in sorted(disc.items()):
-                print(f"  Subject {subject_id} ({psg_name}):  {desc:<20s}  {count} epochs")
-        else:
-            print(f"  Subject {subject_id} ({psg_name}):  (none discarded)")
+    np.save(os.path.join(PROC_DIR, "X_epochs.npy"), X)
+    np.save(os.path.join(PROC_DIR, "y_labels.npy"), y)
+    np.save(os.path.join(PROC_DIR, "subject_ids.npy"), subject_ids)
+    np.save(os.path.join(PROC_DIR, "recording_ids.npy"), recording_ids)
+    np.save(os.path.join(PROC_DIR, "epoch_index.npy"), epoch_index)
 
     # ------------------------------------------------------------------
-    # Z-score normalization
+    # Subject-grouped folds
     # ------------------------------------------------------------------
+    folds = make_folds(subject_ids, n_folds=n_folds, n_val_subjects=n_val_subjects)
     print()
-    print("=" * 60)
-    print("Z-SCORE NORMALIZATION")
-    print("=" * 60)
+    print("=" * 70)
+    print(f"SUBJECT-GROUPED FOLDS  ({len(folds)} folds, {len(set(subject_ids))} subjects)")
+    print("=" * 70)
+    for k, fold in enumerate(folds):
+        parts = [set(fold["train"]), set(fold["val"]), set(fold["test"])]
+        assert not (parts[0] & parts[1] or parts[0] & parts[2] or parts[1] & parts[2]), \
+            f"Subject overlap in fold {k}"
+        print(f"  Fold {k}: train {fold['train']}\n          val {fold['val']}  test {fold['test']}")
+        for name in ("train", "val", "test"):
+            fold[f"n_{name}_epochs"] = int(np.isin(subject_ids, fold[name]).sum())
 
-    means = X.mean(axis=1, keepdims=True)
-    stds = X.std(axis=1, keepdims=True)
-    stds[stds == 0] = 1.0
-    X = (X - means) / stds
-
-    print(f"Post-normalization -- mean range : [{X.mean(axis=1).min():.6f}, {X.mean(axis=1).max():.6f}]")
-    print(f"Post-normalization -- std  range : [{X.std(axis=1).min():.4f}, {X.std(axis=1).max():.4f}]")
-
-    # ------------------------------------------------------------------
-    # Per-subject class distribution
-    # ------------------------------------------------------------------
-    print()
-    print("=" * 60)
-    print("PER-SUBJECT CLASS DISTRIBUTION")
-    print("=" * 60)
-
-    for subject_id, psg_name, _ in SUBJECTS:
-        mask = subject_ids == subject_id
-        if mask.sum() == 0:
-            continue
-        sub_y = y[mask]
-        print(f"\n  Subject {subject_id}  ({psg_name})")
-        for cls_int in sorted(INT_TO_CLASS.keys()):
-            cls_name = INT_TO_CLASS[cls_int]
-            count = int((sub_y == cls_int).sum())
-            print(f"    {cls_int} - {cls_name:5s} : {count:5d}")
-        print(f"    {'':7s} Total : {int(mask.sum()):5d}")
-
-    # ------------------------------------------------------------------
-    # Overall class distribution
-    # ------------------------------------------------------------------
-    print()
-    print("=" * 60)
-    print("OVERALL CLASS DISTRIBUTION")
-    print("=" * 60)
-
-    for cls_int in sorted(INT_TO_CLASS.keys()):
-        cls_name = INT_TO_CLASS[cls_int]
-        count = int((y == cls_int).sum())
-        pct = 100.0 * count / len(y)
-        print(f"  {cls_int} - {cls_name:5s} : {count:5d} epochs  ({pct:5.1f}%)")
-    print(f"  {'':7s} Total : {len(y):5d} epochs")
-
-    # ------------------------------------------------------------------
-    # Save preprocessed data
-    # ------------------------------------------------------------------
-    print()
-    print("=" * 60)
-    print("SAVING PREPROCESSED DATA")
-    print("=" * 60)
-
-    x_path = os.path.join(OUT_DIR, "X_epochs.npy")
-    y_path = os.path.join(OUT_DIR, "y_labels.npy")
-    s_path = os.path.join(OUT_DIR, "subject_ids.npy")
-
-    np.save(x_path, X)
-    np.save(y_path, y)
-    np.save(s_path, subject_ids)
-
-    x_mb = os.path.getsize(x_path) / (1024 * 1024)
-    y_kb = os.path.getsize(y_path) / 1024
-    s_kb = os.path.getsize(s_path) / 1024
-
-    print(f"  X_epochs.npy    : {X.shape}  ({x_mb:.1f} MB)")
-    print(f"  y_labels.npy    : {y.shape}  ({y_kb:.1f} KB)")
-    print(f"  subject_ids.npy : {subject_ids.shape}  ({s_kb:.1f} KB)")
-
-    # ==================================================================
-    # SUBJECT-INDEPENDENT SPLIT
-    # ==================================================================
-    print()
-    print("=" * 60)
-    print("SUBJECT-INDEPENDENT SPLIT")
-    print("=" * 60)
-
-    split_map = {
-        "train_subjects": [],
-        "val_subjects": [],
-        "test_subjects": [],
+    split_info = {
+        "strategy": "subject-grouped k-fold (both nights of a subject in the same split)",
+        "wake_edge_min": WAKE_EDGE_MIN,
+        "n_epochs": int(len(y)),
+        "n_subjects": int(len(set(subject_ids))),
+        "class_counts": {name: int(c) for name, c in
+                         zip(CLASS_NAMES, np.bincount(y, minlength=len(CLASS_NAMES)))},
+        "recordings": recordings,
+        "folds": folds,
     }
-
-    train_idx, val_idx, test_idx = [], [], []
-
-    for subject_id, psg_name, _ in SUBJECTS:
-        role = SPLIT_ASSIGNMENT.get(subject_id)
-        if role is None:
-            continue
-        mask = np.where(subject_ids == subject_id)[0]
-        if len(mask) == 0:
-            continue
-
-        if role == "train":
-            train_idx.extend(mask.tolist())
-            split_map["train_subjects"].append(
-                {"id": subject_id, "file": psg_name, "epochs": int(len(mask))}
-            )
-        elif role == "val":
-            val_idx.extend(mask.tolist())
-            split_map["val_subjects"].append(
-                {"id": subject_id, "file": psg_name, "epochs": int(len(mask))}
-            )
-        elif role == "test":
-            test_idx.extend(mask.tolist())
-            split_map["test_subjects"].append(
-                {"id": subject_id, "file": psg_name, "epochs": int(len(mask))}
-            )
-
-    train_idx = np.array(train_idx, dtype=np.int64)
-    val_idx = np.array(val_idx, dtype=np.int64)
-    test_idx = np.array(test_idx, dtype=np.int64)
-
-    total = len(train_idx) + len(val_idx) + len(test_idx)
-
-    # Print split summary
-    print()
-    print("  Split assignment:")
-    print(f"    Train ({len(split_map['train_subjects'])} subjects):")
-    for s in split_map["train_subjects"]:
-        print(f"      Subject {s['id']}  ({s['file']})  — {s['epochs']} epochs")
-
-    print(f"    Val   ({len(split_map['val_subjects'])} subject):")
-    for s in split_map["val_subjects"]:
-        print(f"      Subject {s['id']}  ({s['file']})  — {s['epochs']} epochs")
-
-    print(f"    Test  ({len(split_map['test_subjects'])} subject):")
-    for s in split_map["test_subjects"]:
-        print(f"      Subject {s['id']}  ({s['file']})  — {s['epochs']} epochs")
+    with open(os.path.join(PROC_DIR, "split_info.json"), "w") as f:
+        json.dump(split_info, f, indent=2)
 
     print()
-    print(f"  Split sizes:")
-    print(f"    Train : {len(train_idx):5d} epochs  ({100*len(train_idx)/total:.1f}%)")
-    print(f"    Val   : {len(val_idx):5d} epochs  ({100*len(val_idx)/total:.1f}%)")
-    print(f"    Test  : {len(test_idx):5d} epochs  ({100*len(test_idx)/total:.1f}%)")
-    print(f"    Total : {total:5d} epochs")
-
-    # Verify no overlap
-    train_set = set(train_idx.tolist())
-    val_set = set(val_idx.tolist())
-    test_set = set(test_idx.tolist())
-
-    overlap_tv = train_set & val_set
-    overlap_tt = train_set & test_set
-    overlap_vt = val_set & test_set
-
-    print()
-    if not overlap_tv and not overlap_tt and not overlap_vt:
-        print("  [PASS] No overlap between train / val / test splits.")
-    else:
-        print(f"  [FAIL] Overlaps found: train&val={len(overlap_tv)}, "
-              f"train&test={len(overlap_tt)}, val&test={len(overlap_vt)}")
-
-    # Verify subject independence
-    train_subs = set(subject_ids[train_idx].tolist())
-    val_subs = set(subject_ids[val_idx].tolist())
-    test_subs = set(subject_ids[test_idx].tolist())
-
-    if not (train_subs & val_subs) and not (train_subs & test_subs) and not (val_subs & test_subs):
-        print("  [PASS] Splits are fully subject-independent (no subject in multiple splits).")
-    else:
-        print("  [FAIL] Subject appears in multiple splits!")
-
-    # Per-class distribution in each split
-    for split_name, indices in [("Train", train_idx), ("Val", val_idx), ("Test", test_idx)]:
-        split_y = y[indices]
-        print(f"\n  {split_name} class distribution:")
-        for cls_int in sorted(INT_TO_CLASS.keys()):
-            cls_name = INT_TO_CLASS[cls_int]
-            count = int((split_y == cls_int).sum())
-            pct = 100.0 * count / len(split_y)
-            print(f"    {cls_int} - {cls_name:5s} : {count:5d}  ({pct:5.1f}%)")
-
-    # Save split indices and metadata
-    np.save(os.path.join(OUT_DIR, "train_indices.npy"), train_idx)
-    np.save(os.path.join(OUT_DIR, "val_indices.npy"), val_idx)
-    np.save(os.path.join(OUT_DIR, "test_indices.npy"), test_idx)
-
-    split_meta = {
-        "strategy": "subject-independent (LOSO)",
-        "train": {
-            "subjects": [s["id"] for s in split_map["train_subjects"]],
-            "files": [s["file"] for s in split_map["train_subjects"]],
-            "n_epochs": int(len(train_idx)),
-        },
-        "val": {
-            "subjects": [s["id"] for s in split_map["val_subjects"]],
-            "files": [s["file"] for s in split_map["val_subjects"]],
-            "n_epochs": int(len(val_idx)),
-        },
-        "test": {
-            "subjects": [s["id"] for s in split_map["test_subjects"]],
-            "files": [s["file"] for s in split_map["test_subjects"]],
-            "n_epochs": int(len(test_idx)),
-        },
-    }
-
-    meta_path = os.path.join(OUT_DIR, "split_info.json")
-    with open(meta_path, "w") as f:
-        json.dump(split_meta, f, indent=2)
-
-    print()
-    print("=" * 60)
-    print("SAVED SPLIT FILES")
-    print("=" * 60)
-    print(f"  train_indices.npy : {train_idx.shape}")
-    print(f"  val_indices.npy   : {val_idx.shape}")
-    print(f"  test_indices.npy  : {test_idx.shape}")
-    print(f"  split_info.json   : split metadata")
-
-    print()
-    print("=" * 60)
-    print("Preprocessing and splitting complete.")
-    print("=" * 60)
+    print(f"  Saved X_epochs.npy {X.shape}, labels, subject/recording IDs and split_info.json")
+    print("Preprocessing complete.")
 
 
 if __name__ == "__main__":
-    preprocess()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--val-subjects", type=int, default=2)
+    args = parser.parse_args()
+    preprocess(n_folds=args.folds, n_val_subjects=args.val_subjects)

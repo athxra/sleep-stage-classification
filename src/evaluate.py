@@ -1,181 +1,117 @@
 """
 evaluate.py
 ===========
-Evaluate the best saved model on the held-out TEST set.
+Evaluate the saved model on its held-out TEST subjects (never used for
+training or checkpoint selection).
 
 Metrics:
-  - Overall accuracy
-  - Per-class precision, recall, F1
-  - Macro-averaged precision, recall, F1
-  - Confusion matrix
+  - Accuracy, macro-F1, Cohen's kappa (and the majority-class baseline)
+  - Per-class precision, recall, F1 and confusion matrix
+  - N1 / REM confusion focus
+  - Stage-transition-aware analysis: performance on epochs next to an
+    expert-scored stage change vs. epochs inside stable stage runs
+
+Writes outputs/test_metrics.json (read by the dashboard) and
+outputs/test_predictions.npz.
 
 Usage:
     python src/evaluate.py
 """
 
+import json
 import os
 import sys
+
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from src.model import SleepCNN, count_parameters, model_size_mb
+from src.config import (CLASS_NAMES, MODEL_PATH, OUTPUT_DIR, TEST_METRICS_PATH)
+from src.metrics import compute_metrics
+from src.model import count_macs, count_parameters, load_checkpoint, model_size_mb
+from src.train import load_data, predict
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-PROC_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
+def print_report(m: dict) -> None:
+    print("=" * 64)
+    print("TEST SET RESULTS")
+    print("=" * 64)
+    print(f"  Test subjects        : {m['test_subjects']}  ({m['n_epochs']} epochs)")
+    print(f"  Accuracy             : {100 * m['accuracy']:.2f}%  "
+          f"(majority-class baseline {100 * m['majority_class_baseline']:.2f}%)")
+    print(f"  Macro F1             : {m['macro_f1']:.4f}")
+    print(f"  Cohen's kappa        : {m['cohen_kappa']:.4f}")
 
-N_CLASSES = 5
-BATCH_SIZE = 256
-CLASS_NAMES = ["Wake", "N1", "N2", "N3", "REM"]
+    print(f"\n  {'Class':<6s} {'Prec':>7s} {'Recall':>7s} {'F1':>7s} {'Support':>8s}")
+    for name in CLASS_NAMES:
+        c = m["per_class"][name]
+        print(f"  {name:<6s} {c['precision']:7.4f} {c['recall']:7.4f} {c['f1']:7.4f} {c['support']:8d}")
+
+    print("\n  Confusion matrix (rows = expert, cols = predicted)")
+    print("  " + " " * 6 + "".join(f"{n:>7s}" for n in CLASS_NAMES))
+    for name, row in zip(CLASS_NAMES, m["confusion_matrix"]):
+        print(f"  {name:<6s}" + "".join(f"{v:7d}" for v in row))
+
+    print("\n  Top confusions")
+    for c in m["top_confusions"]:
+        print(f"    {c['true']:>5s} -> {c['predicted']:<5s} {c['count']:5d}  "
+              f"({100 * c['rate']:.1f}% of {c['true']})")
+
+    t = m["transition_analysis"]
+    print("\n  Stage-transition analysis")
+    for key, label in (("stable", "Stable epochs"), ("near_transition", "Near a transition")):
+        s = t[key]
+        if s["n_epochs"]:
+            print(f"    {label:<18s} n={s['n_epochs']:5d}  acc {100 * s['accuracy']:.2f}%  "
+                  f"macro-F1 {s['macro_f1']:.4f}")
 
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-def evaluate():
+def evaluate(model_path: str = MODEL_PATH) -> dict:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
 
-    # ------------------------------------------------------------------
-    # Load test data
-    # ------------------------------------------------------------------
-    print("\nLoading test data...")
-    X = np.load(os.path.join(PROC_DIR, "X_epochs.npy"))
-    y = np.load(os.path.join(PROC_DIR, "y_labels.npy"))
-    test_idx = np.load(os.path.join(PROC_DIR, "test_indices.npy"))
+    model, ckpt = load_checkpoint(model_path, device)
+    data = load_data()
+    test_mask = np.isin(data["subject_ids"], ckpt["test_subjects"])
+    assert not set(ckpt["test_subjects"]) & set(ckpt["train_subjects"] + ckpt["val_subjects"]), \
+        "Test subjects overlap with training/validation subjects"
 
-    X_test = X[test_idx]
-    y_test = y[test_idx]
-    print(f"  Test epochs : {len(X_test)}")
+    y_true = data["y_labels"][test_mask]
+    y_pred = predict(model, data["X_epochs"][test_mask], device)
+    rec_ids = data["recording_ids"][test_mask]
+    epoch_idx = data["epoch_index"][test_mask]
 
-    X_t = torch.from_numpy(X_test).unsqueeze(1).float()
-    y_t = torch.from_numpy(y_test).long()
-    test_loader = DataLoader(
-        TensorDataset(X_t, y_t), batch_size=BATCH_SIZE, shuffle=False,
-    )
+    metrics = compute_metrics(y_true, y_pred, rec_ids, epoch_idx)
+    recordings = {r["id"]: r["psg"] for r in data["split_info"]["recordings"]}
+    metrics.update({
+        "test_subjects": ckpt["test_subjects"],
+        "val_subjects": ckpt["val_subjects"],
+        "train_subjects": ckpt["train_subjects"],
+        "test_recordings": sorted({recordings[int(r)] for r in np.unique(rec_ids)}),
+        "fold": ckpt["fold"],
+        "checkpoint_epoch": ckpt["epoch"],
+        "val_macro_f1": ckpt["val_f1"],
+        "model": {
+            "parameters": count_parameters(model),
+            "size_mb": round(model_size_mb(model), 3),
+            "macs_per_epoch": count_macs(model.cpu()),
+            "checkpoint_mb": round(os.path.getsize(model_path) / 2**20, 3),
+        },
+        "dataset": {
+            "n_subjects": data["split_info"]["n_subjects"],
+            "n_recordings": len(data["split_info"]["recordings"]),
+            "n_epochs": data["split_info"]["n_epochs"],
+            "wake_edge_min": data["split_info"]["wake_edge_min"],
+        },
+    })
 
-    # ------------------------------------------------------------------
-    # Load best model
-    # ------------------------------------------------------------------
-    print("\nLoading best model...")
-    model = SleepCNN(n_classes=N_CLASSES).to(device)
-
-    ckpt_path = os.path.join(MODEL_DIR, "best_model.pth")
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    print(f"  Checkpoint epoch   : {checkpoint['epoch']}")
-    print(f"  Val macro-F1 (ckpt): {checkpoint['val_f1']:.4f}")
-    print(f"  Trainable params   : {count_parameters(model):,}")
-    print(f"  Model size         : {model_size_mb(model):.2f} MB")
-
-    # Saved checkpoint file size
-    ckpt_mb = os.path.getsize(ckpt_path) / (1024 * 1024)
-    print(f"  Checkpoint file    : {ckpt_mb:.2f} MB")
-
-    # ------------------------------------------------------------------
-    # Inference on test set
-    # ------------------------------------------------------------------
-    all_preds = []
-    all_labels = []
-
-    with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            X_batch = X_batch.to(device)
-            logits = model(X_batch)
-            preds = logits.argmax(dim=1).cpu().numpy()
-            all_preds.extend(preds)
-            all_labels.extend(y_batch.numpy())
-
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
-    accuracy = accuracy_score(all_labels, all_preds)
-    macro_f1 = f1_score(all_labels, all_preds, average="macro")
-
-    print()
-    print("=" * 60)
-    print("TEST SET RESULTS")
-    print("=" * 60)
-
-    print(f"\n  Overall Accuracy : {accuracy * 100:.2f}%")
-    print(f"  Macro F1-Score   : {macro_f1:.4f}")
-
-    # Per-class report
-    print()
-    print("  Classification Report:")
-    print("  " + "-" * 56)
-    report = classification_report(
-        all_labels, all_preds,
-        target_names=CLASS_NAMES,
-        digits=4,
-    )
-    for line in report.split("\n"):
-        print(f"  {line}")
-
-    # Confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
-
-    print()
-    print("  Confusion Matrix:")
-    print(f"  {'':>8s}", end="")
-    for name in CLASS_NAMES:
-        print(f"  {name:>6s}", end="")
-    print("   <-- Predicted")
-    print(f"  {'':>8s}", end="")
-    for _ in CLASS_NAMES:
-        print(f"  {'------':>6s}", end="")
-    print()
-
-    for i, name in enumerate(CLASS_NAMES):
-        print(f"  {name:>8s}", end="")
-        for j in range(N_CLASSES):
-            print(f"  {cm[i][j]:>6d}", end="")
-        print()
-
-    # ------------------------------------------------------------------
-    # Save results
-    # ------------------------------------------------------------------
-    results = {
-        "accuracy": float(accuracy),
-        "macro_f1": float(macro_f1),
-        "confusion_matrix": cm,
-        "predictions": all_preds,
-        "true_labels": all_labels,
-    }
-
-    np.savez(
-        os.path.join(OUTPUT_DIR, "test_results.npz"),
-        accuracy=accuracy,
-        macro_f1=macro_f1,
-        confusion_matrix=cm,
-        predictions=all_preds,
-        true_labels=all_labels,
-    )
-
-    print()
-    print(f"  Results saved to: outputs/test_results.npz")
-    print()
-    print("=" * 60)
-    print("Evaluation complete.")
-    print("=" * 60)
+    print_report(metrics)
+    with open(TEST_METRICS_PATH, "w") as f:
+        json.dump(metrics, f, indent=2)
+    np.savez(os.path.join(OUTPUT_DIR, "test_predictions.npz"), y_true=y_true, y_pred=y_pred,
+             recording_ids=rec_ids, epoch_index=epoch_idx)
+    print(f"\n  Saved {os.path.relpath(TEST_METRICS_PATH)} and test_predictions.npz")
+    return metrics
 
 
 if __name__ == "__main__":
