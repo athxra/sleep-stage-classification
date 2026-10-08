@@ -1,30 +1,41 @@
 """
 model.py
 ========
-Lightweight 1D CNN for 5-class sleep stage classification.
+Lightweight single-channel 1D CNN for 5-class sleep stage classification.
 
-Architecture (174,597 trainable parameters, ~0.67 MB):
-    Input (1, 3000)
-    -> Conv1d(1->64,  k=7, pad=3)  -> BatchNorm1d(64)  -> ReLU
-    -> Conv1d(64->128, k=5, pad=2) -> BatchNorm1d(128) -> ReLU
-    -> Conv1d(128->256, k=3, pad=1) -> BatchNorm1d(256) -> ReLU
-    -> MaxPool1d(k=2)              — halves temporal dim: 3000 -> 1500
-    -> AdaptiveAvgPool1d(1)        — Global Average Pooling: 1500 -> 1
-    -> Linear(256, 128) -> ReLU -> Dropout(0.5)
-    -> Linear(128, 5)
+Architecture:
+    Input (1, 3000)                                         30 s @ 100 Hz
+    -> Conv1d(1->32,  k=50, stride=6)  -> BN -> ReLU        ~0.5 s filters
+    -> MaxPool1d(8) -> Dropout(0.25)                        3000 -> 62
+    -> Conv1d(32->64, k=7, same) -> BN -> ReLU
+    -> Conv1d(64->64, k=7, same) -> BN -> ReLU
+    -> MaxPool1d(4) -> Dropout(0.25)                        62 -> 15
+    -> Conv1d(64->128, k=7, same) -> BN -> ReLU
+    -> AdaptiveAvgPool1d(1)                                 Global Average Pooling
+    -> Dropout(0.5) -> Linear(128, 5)
 
 Design notes:
-  - "Same" padding on Conv1d layers preserves the temporal dimension
-    through the convolutional blocks (3000 throughout).
-  - Global Average Pooling collapses (B, 256, 1500) -> (B, 256, 1),
-    avoiding a 384K-dim Flatten that would inflate the model to ~49M
-    parameters. This keeps the model truly lightweight.
-  - Softmax is omitted from forward() because PyTorch's CrossEntropyLoss
-    applies log-softmax internally.
+  - The wide, strided first layer (kernel = fs/2, stride = fs/16, as in the
+    small-filter branch of DeepSleepNet) lets each filter see ~0.5 s of EEG,
+    enough to capture delta waves, spindles and K-complexes, instead of the
+    ~0.13 s receptive field of stacked stride-1 kernels.
+  - Pooling between blocks grows the receptive field to ~17 s before Global
+    Average Pooling and cuts compute to ~5 M multiply-accumulates per epoch,
+    which is what matters for low-power / wearable deployment.
+  - Softmax is omitted from forward() because CrossEntropyLoss applies
+    log-softmax internally.
 """
 
 import torch
 import torch.nn as nn
+
+
+def _conv_block(in_ch: int, out_ch: int, kernel: int, stride: int = 1, padding="same"):
+    return [
+        nn.Conv1d(in_ch, out_ch, kernel_size=kernel, stride=stride, padding=padding, bias=False),
+        nn.BatchNorm1d(out_ch),
+        nn.ReLU(inplace=True),
+    ]
 
 
 class SleepCNN(nn.Module):
@@ -33,32 +44,21 @@ class SleepCNN(nn.Module):
     def __init__(self, n_classes: int = 5):
         super().__init__()
 
-        # ----- Feature extractor -----
         self.features = nn.Sequential(
-            # Block 1: Conv1d 64 filters, kernel 7
-            nn.Conv1d(in_channels=1, out_channels=64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
+            *_conv_block(1, 32, kernel=50, stride=6, padding=22),
+            nn.MaxPool1d(8),
+            nn.Dropout(0.25),
 
-            # Block 2: Conv1d 128 filters, kernel 5
-            nn.Conv1d(in_channels=64, out_channels=128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True),
+            *_conv_block(32, 64, kernel=7),
+            *_conv_block(64, 64, kernel=7),
+            nn.MaxPool1d(4),
+            nn.Dropout(0.25),
 
-            # Block 3: Conv1d 256 filters, kernel 3
-            nn.Conv1d(in_channels=128, out_channels=256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-
-            # Pooling: MaxPool then Global Average Pool
-            nn.MaxPool1d(kernel_size=2),
-            nn.AdaptiveAvgPool1d(1),          # (B, 256, 1)
+            *_conv_block(64, 128, kernel=7),
+            nn.AdaptiveAvgPool1d(1),          # (B, 128, 1)
         )
 
-        # ----- Classifier -----
         self.classifier = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
             nn.Dropout(0.5),
             nn.Linear(128, n_classes),
         )
@@ -74,10 +74,8 @@ class SleepCNN(nn.Module):
         -------
         logits : Tensor of shape (batch, n_classes)
         """
-        x = self.features(x)       # (B, 256, 1)
-        x = x.squeeze(-1)          # (B, 256)
-        x = self.classifier(x)     # (B, n_classes)
-        return x
+        x = self.features(x).squeeze(-1)   # (B, 128)
+        return self.classifier(x)          # (B, n_classes)
 
 
 # ---------------------------------------------------------------------------
@@ -94,14 +92,50 @@ def model_size_mb(model: nn.Module) -> float:
     return total_bytes / (1024 * 1024)
 
 
+def count_macs(model: nn.Module, n_samples: int = 3000) -> int:
+    """Multiply-accumulate operations for one epoch (Conv1d + Linear layers)."""
+    macs = 0
+
+    def conv_hook(module, _inp, out):
+        nonlocal macs
+        macs += out.numel() * (module.in_channels // module.groups) * module.kernel_size[0]
+
+    def linear_hook(module, _inp, out):
+        nonlocal macs
+        macs += out.numel() * module.in_features
+
+    hooks = []
+    for m in model.modules():
+        if isinstance(m, nn.Conv1d):
+            hooks.append(m.register_forward_hook(conv_hook))
+        elif isinstance(m, nn.Linear):
+            hooks.append(m.register_forward_hook(linear_hook))
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        model(torch.zeros(1, 1, n_samples))
+    model.train(was_training)
+    for h in hooks:
+        h.remove()
+    return macs
+
+
+def load_checkpoint(path: str, device="cpu"):
+    """Load a checkpoint saved by train.py; returns (model, checkpoint dict)."""
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    model = SleepCNN(n_classes=checkpoint.get("n_classes", 5)).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model, checkpoint
+
+
 if __name__ == "__main__":
-    # Quick sanity check
     model = SleepCNN(n_classes=5)
     print(model)
     print(f"\nTrainable parameters : {count_parameters(model):,}")
     print(f"Model size           : {model_size_mb(model):.2f} MB")
+    print(f"MACs per epoch       : {count_macs(model) / 1e6:.2f} M")
 
-    # Test forward pass
     dummy = torch.randn(4, 1, 3000)
     out = model(dummy)
     print(f"Input shape          : {dummy.shape}")

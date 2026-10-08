@@ -4,24 +4,34 @@ Sleep Stage Classification Dashboard
 Streamlit dashboard for the Sleep Stage Classification from EEG Signals
 project using a Lightweight 1D CNN.
 
+All numbers shown are read from the files written by the pipeline
+(outputs/test_metrics.json, outputs/cv_metrics.json, models/best_model.pth),
+and inference uses the same epoching / normalization code as training.
+
 Usage:
     streamlit run dashboard/app.py
 """
 
-import os
 import glob
+import json
+import os
 import sys
+import time
 
-import streamlit as st
 import numpy as np
-import mne
 import plotly.graph_objects as go
+import streamlit as st
 import torch
 import torch.nn.functional as F
 
-# Add project root to sys.path to import src
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from src.model import SleepCNN
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from src.config import (CHANNEL, CLASS_NAMES, CV_METRICS_PATH, EPOCH_SAMPLES, EPOCH_SEC,
+                        MODEL_PATH, RAW_DIR, SAMPLE_DIR, SFREQ, TEST_METRICS_PATH,
+                        parse_recording, recording_key)
+from src.metrics import compute_metrics, sleep_summary
+from src.model import count_macs, count_parameters, load_checkpoint, model_size_mb
+from src.signals import (UNSCORED, labels_on_grid, segment_epochs, sleep_period_mask,
+                         zscore_epochs)
 
 
 # ---------------------------------------------------------------------------
@@ -160,27 +170,176 @@ with st.sidebar:
     st.caption("Minor Project • 2026")
 
 
+CLASS_COLORS = ["#4fc3f7", "#7c83ff", "#ab47bc", "#5c6bc0", "#ef5350"]
+# Hypnogram y-axis order: Wake on top, then REM, N1, N2, N3 (clinical convention).
+HYPNO_LEVEL = {0: 4, 4: 3, 1: 2, 2: 1, 3: 0}
+HYPNO_TICKS = dict(tickmode="array", tickvals=[4, 3, 2, 1, 0],
+                   ticktext=["Wake", "REM", "N1", "N2", "N3"])
+DEMO_NAME = "Demo sample"
+PLOT_LAYOUT = dict(
+    template="plotly_dark",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(30,30,47,0.6)",
+    margin=dict(l=60, r=20, t=30, b=50),
+    xaxis=dict(gridcolor="rgba(255,255,255,0.06)", zeroline=False),
+    yaxis=dict(gridcolor="rgba(255,255,255,0.06)"),
+    hoverlabel=dict(bgcolor="#2d2d44"),
+)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+def metric_cards(items, value_size=None):
+    style = f' style="font-size:{value_size}"' if value_size else ""
+    for col, (value, label) in zip(st.columns(len(items)), items):
+        with col:
+            st.markdown(
+                f'<div class="metric-card"><div class="metric-value"{style}>{value}</div>'
+                f'<div class="metric-label">{label}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+
+def header(title, subtitle):
+    st.markdown(f'<div class="hero-title">{title}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="hero-subtitle">{subtitle}</div>', unsafe_allow_html=True)
+
+
+def section(title):
+    st.markdown(f'<div class="section-header">{title}</div>', unsafe_allow_html=True)
+
+
+def load_json(path):
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def fmt_min(value):
+    return "—" if value is None else f"{value:.0f} min"
+
+
+@st.cache_resource(show_spinner="Loading PyTorch model...")
+def get_model():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+    return load_checkpoint(MODEL_PATH, "cpu")
+
+
+def list_recordings():
+    """Available recordings: raw PSG files if present, else the bundled demo sample."""
+    hypnos = {recording_key(p): p for p in glob.glob(os.path.join(RAW_DIR, "SC4*-Hypnogram.edf"))}
+    recs = {os.path.basename(p): (p, hypnos.get(recording_key(p)))
+            for p in sorted(glob.glob(os.path.join(RAW_DIR, "SC4*-PSG.edf")))}
+    return recs or {DEMO_NAME: (None, None)}
+
+
+@st.cache_data(show_spinner="Loading EEG recording...", max_entries=4)
+def load_recording(name, psg_path, hyp_path):
+    """
+    Return (signal_volts, expert_labels_or_None, info). Expert labels are on
+    the same 30-s grid used for inference, so they align epoch-for-epoch.
+    """
+    if psg_path is None:
+        signal = np.load(os.path.join(SAMPLE_DIR, "demo_eeg.npy")).astype(np.float64)
+        labels_path = os.path.join(SAMPLE_DIR, "demo_labels.npy")
+        labels = np.load(labels_path) if os.path.isfile(labels_path) else None
+        info = load_json(os.path.join(SAMPLE_DIR, "demo_info.json")) or {}
+        return signal, labels, info
+
+    import mne
+    from src.signals import load_fpz_cz
+
+    signal = load_fpz_cz(psg_path)
+    labels = None
+    if hyp_path:
+        labels = labels_on_grid(mne.read_annotations(hyp_path), len(signal) // EPOCH_SAMPLES)
+    subject, night = parse_recording(name)
+    return signal, labels, {"subject": subject, "night": night}
+
+
+@st.cache_data(show_spinner="Running CNN inference...", max_entries=4)
+def predict_probs(name, _signal):
+    """Softmax probabilities (n_epochs, 5) for every 30-s epoch (cached per recording name)."""
+    model, _ = get_model()
+    epochs = zscore_epochs(segment_epochs(_signal))
+    probs = []
+    with torch.no_grad():
+        for i in range(0, len(epochs), 512):
+            x = torch.from_numpy(epochs[i:i + 512]).unsqueeze(1)
+            probs.append(F.softmax(model(x), dim=1).numpy())
+    return np.concatenate(probs) if probs else np.zeros((0, len(CLASS_NAMES)))
+
+
+def subject_role(subject):
+    """Which split the deployed model used this subject for (train / val / test)."""
+    try:
+        _, ckpt = get_model()
+    except Exception:
+        return None
+    for role in ("test", "val", "train"):
+        if subject in ckpt.get(f"{role}_subjects", []):
+            return role
+    return "unseen"
+
+
+def recording_picker(key):
+    recs = list_recordings()
+    if DEMO_NAME in recs:
+        st.warning("⚠️ **Demo Mode Active**: no raw EDF files found in `data/raw/`. "
+                   "Using the bundled sample EEG (100 Hz, Fpz-Cz).")
+    name = st.selectbox("PSG recording", options=list(recs), index=0, key=key)
+    psg_path, hyp_path = recs[name]
+    try:
+        signal, labels, info = load_recording(name, psg_path, hyp_path)
+    except Exception as exc:
+        st.error(f"Failed to load recording: {exc}")
+        st.stop()
+
+    role = subject_role(info.get("subject")) if "subject" in info else None
+    if role == "test":
+        st.success(f"Subject {info['subject']} is a held-out **test** subject: "
+                   "predictions here reflect genuine unseen-subject performance.")
+    elif role in ("train", "val"):
+        st.info(f"Subject {info['subject']} was used for model **{role}ing**, so "
+                "agreement with the expert here is optimistic. Pick a test subject "
+                "for an honest view.")
+    if info.get("source"):
+        st.caption(f"Sample source: {info['source']}")
+    return name, signal, labels, info
+
+
+def hypnogram_figure(hours, predicted, expert=None, x_max=None, height=380):
+    fig = go.Figure()
+    if expert is not None:
+        scored = expert != UNSCORED
+        y_exp = np.where(scored, [HYPNO_LEVEL.get(int(s), np.nan) for s in expert], np.nan)
+        fig.add_trace(go.Scatter(x=hours, y=y_exp, mode="lines", name="Expert",
+                                 line=dict(color="rgba(255,255,255,0.55)", shape="hv", width=2)))
+    fig.add_trace(go.Scatter(x=hours, y=[HYPNO_LEVEL[int(p)] for p in predicted],
+                             mode="lines", name="CNN prediction",
+                             line=dict(color="#7c83ff", shape="hv", width=1.5)))
+    layout = dict(PLOT_LAYOUT)
+    layout["yaxis"] = dict(HYPNO_TICKS, range=[-0.4, 4.4], gridcolor="rgba(255,255,255,0.06)")
+    layout["xaxis"] = dict(title="Time (hours)", gridcolor="rgba(255,255,255,0.06)",
+                           range=[hours[0] if len(hours) else 0, x_max] if x_max else None)
+    fig.update_layout(**layout, height=height,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Page: Overview
 # ---------------------------------------------------------------------------
 def page_overview():
-    # Hero
-    st.markdown('<div class="hero-title">Sleep Stage Classification from EEG Signals</div>',
-                unsafe_allow_html=True)
-    st.markdown(
-        '<div class="hero-subtitle">'
-        'Automated sleep staging using a lightweight 1D CNN on single-channel EEG'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+    header("Sleep Stage Classification from EEG Signals",
+           "Automated sleep staging using a lightweight 1D CNN on single-channel EEG")
 
-    # --- Sleep stages explanation ---
-    st.markdown('<div class="section-header">🌙 Sleep Stages</div>', unsafe_allow_html=True)
-    st.markdown(
-        "This system classifies 30-second EEG epochs into **five** standard sleep stages "
-        "based on the AASM scoring standard:"
-    )
-
+    section("🌙 Sleep Stages")
+    st.markdown("This system classifies 30-second EEG epochs into **five** standard sleep "
+                "stages based on the AASM scoring standard:")
     st.markdown("""
     <div class="stage-row">
         <span class="stage-badge badge-wake">Wake</span>
@@ -190,780 +349,421 @@ def page_overview():
         <span class="stage-badge badge-rem">REM — Rapid Eye Movement</span>
     </div>
     """, unsafe_allow_html=True)
+    st.markdown("")
 
-    st.markdown("")  # spacer
+    metrics = load_json(TEST_METRICS_PATH)
+    cv = load_json(CV_METRICS_PATH)
+    section("📊 Project at a Glance")
+    if metrics is None:
+        st.warning("No evaluation results yet. Run `python src/evaluate.py` to generate "
+                   "`outputs/test_metrics.json`.")
+    else:
+        ds, mdl = metrics["dataset"], metrics["model"]
+        f1_value = (f"{cv['macro_f1']['mean']:.3f} ± {cv['macro_f1']['std']:.3f}" if cv
+                    else f"{metrics['macro_f1']:.3f}")
+        metric_cards([
+            (f"{ds['n_subjects']} / {ds['n_recordings']}", "Subjects / Recordings"),
+            (f"{ds['n_epochs']:,}", "Scored Epochs"),
+            (f"{mdl['parameters']:,}", "Model Parameters"),
+            (f1_value, "Macro-F1" + (" (CV)" if cv else " (Test)")),
+        ])
+    st.markdown("")
 
-    # --- Key metrics ---
-    st.markdown('<div class="section-header">📊 Project at a Glance</div>', unsafe_allow_html=True)
-
-    cols = st.columns(4)
-
-    metrics = [
-        ("16,688", "Total Valid Epochs"),
-        ("6", "EDF Recordings"),
-        ("174,597", "Model Parameters"),
-        ("89.00%", "Test Accuracy"),
-    ]
-
-    for col, (value, label) in zip(cols, metrics):
-        with col:
-            st.markdown(
-                f'<div class="metric-card">'
-                f'  <div class="metric-value">{value}</div>'
-                f'  <div class="metric-label">{label}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-    st.markdown("")  # spacer
-
-    # --- Dataset & Model details ---
     left_col, right_col = st.columns(2)
-
     with left_col:
-        st.markdown('<div class="section-header">📂 Dataset Details</div>', unsafe_allow_html=True)
-
-        details_data = {
-            "Source": "Sleep-EDF Expanded (PhysioNet)",
-            "Recordings Used": "6 subjects",
-            "EEG Channel": "Fpz-Cz",
-            "Sampling Rate": "100 Hz",
-            "Epoch Length": "30 seconds (3,000 samples)",
+        section("📂 Dataset Details")
+        details = {
+            "Source": "Sleep-EDF Expanded, Sleep-Cassette (PhysioNet)",
+            "EEG Channel": "Fpz-Cz (single channel)",
+            "Sampling Rate": f"{SFREQ} Hz",
+            "Epoch Length": f"{EPOCH_SEC} seconds ({EPOCH_SAMPLES:,} samples)",
             "Sleep Stages": "5 (Wake, N1, N2, N3, REM)",
         }
-
-        for key, val in details_data.items():
+        if metrics:
+            details["Wake kept"] = (f"{metrics['dataset']['wake_edge_min']} min before sleep "
+                                    "onset / after final awakening")
+        for key, val in details.items():
             st.markdown(f"**{key}:** {val}")
-
     with right_col:
-        st.markdown('<div class="section-header">🤖 Model Details</div>', unsafe_allow_html=True)
-
-        model_details = {
-            "Architecture": "Lightweight 1D CNN",
-            "Conv Blocks": "3 (64 → 128 → 256 filters)",
-            "Pooling": "MaxPool + Global Average Pooling",
-            "Classifier": "Dense(128) → Dropout(0.5) → Dense(5)",
-            "Parameters": "174,597 (~0.67 MB)",
-            "Framework": "PyTorch",
+        section("🤖 Model Details")
+        try:
+            model, _ = get_model()
+            params, size, macs = count_parameters(model), model_size_mb(model), count_macs(model)
+        except Exception:
+            params = size = macs = None
+        details = {
+            "Architecture": "Lightweight single-channel 1D CNN",
+            "Front end": "Wide strided conv (0.5 s filters) + max-pooling",
+            "Feature blocks": "32 → 64 → 64 → 128 filters, ~17 s receptive field",
+            "Head": "Global Average Pooling → Dropout(0.5) → Dense(5)",
         }
-
-        for key, val in model_details.items():
+        if params:
+            details["Size"] = f"{params:,} parameters (~{size:.2f} MB)"
+            details["Compute"] = f"{macs / 1e6:.1f} M multiply-accumulates per 30-s epoch"
+        for key, val in details.items():
             st.markdown(f"**{key}:** {val}")
+    st.markdown("")
 
-    st.markdown("")  # spacer
-
-    # --- Processing pipeline ---
-    st.markdown('<div class="section-header">⚙️ Processing Pipeline</div>', unsafe_allow_html=True)
-
+    section("⚙️ Processing Pipeline")
     steps = [
         "1️⃣  Load raw PSG (.edf) and Hypnogram files using MNE-Python",
-        "2️⃣  Extract single-channel EEG (Fpz-Cz) at 100 Hz",
-        "3️⃣  Segment into 30-second epochs (3,000 samples each)",
-        "4️⃣  Map annotations to 5 classes — merge S3+S4 → N3, discard unknowns",
+        "2️⃣  Extract single-channel EEG (Fpz-Cz) at 100 Hz and cut 30-second epochs",
+        "3️⃣  Map annotations to 5 classes — merge S3+S4 → N3, discard unscored epochs",
+        "4️⃣  Keep the sleep period plus 30 min of Wake on either side",
         "5️⃣  Apply per-epoch Z-score normalization",
-        "6️⃣  Subject-independent train / val / test split (no data leakage)",
-        "7️⃣  Train lightweight CNN with class-weighted loss",
-        "8️⃣  Evaluate on completely unseen test subject",
+        "6️⃣  Split by subject — both nights of a person always stay in the same split",
+        "7️⃣  Train the lightweight CNN with class-weighted loss and augmentation",
+        "8️⃣  Evaluate on unseen subjects: F1, Cohen's κ, N1/REM and transition analysis",
     ]
-
     for step in steps:
         st.markdown(f'<div class="pipeline-step">{step}</div>', unsafe_allow_html=True)
 
-    st.markdown("")  # spacer
-
-    # --- Split info ---
-    st.markdown('<div class="section-header">📋 Data Split</div>', unsafe_allow_html=True)
-
-    split_col1, split_col2, split_col3 = st.columns(3)
-
-    with split_col1:
-        st.markdown(
-            '<div class="metric-card">'
-            '  <div class="metric-value">11,129</div>'
-            '  <div class="metric-label">Train Epochs (4 subjects)</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-    with split_col2:
-        st.markdown(
-            '<div class="metric-card">'
-            '  <div class="metric-value">2,804</div>'
-            '  <div class="metric-label">Validation Epochs (1 subject)</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-    with split_col3:
-        st.markdown(
-            '<div class="metric-card">'
-            '  <div class="metric-value">2,755</div>'
-            '  <div class="metric-label">Test Epochs (1 subject)</div>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+    if metrics:
+        st.markdown("")
+        section("📋 Data Split (deployed model)")
+        metric_cards([
+            (", ".join(map(str, metrics["train_subjects"])), "Train Subjects"),
+            (", ".join(map(str, metrics["val_subjects"])), "Validation Subjects"),
+            (", ".join(map(str, metrics["test_subjects"])), "Test Subjects (unseen)"),
+        ], value_size="1.1rem")
 
 
 # ---------------------------------------------------------------------------
 # Page: EEG Signal Viewer
 # ---------------------------------------------------------------------------
-DATA_RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
-PREFERRED_CHANNEL = "EEG Fpz-Cz"
-
-
-@st.cache_resource(show_spinner="Loading EDF file...")
-def load_raw_edf(filepath: str):
-    """Load a PSG EDF lazily (preload=False) and return the Raw object."""
-    raw = mne.io.read_raw_edf(filepath, preload=False, verbose=False)
-    return raw
-
-
 def page_eeg_viewer():
-    st.markdown('<div class="hero-title">EEG Signal Viewer</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="hero-subtitle">'
-        'Browse and visualise raw Fpz-Cz EEG recordings from the Sleep-EDF dataset'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+    header("EEG Signal Viewer",
+           "Browse and visualise raw Fpz-Cz EEG recordings from the Sleep-EDF dataset")
+    section("📂 Select Recording")
+    name, signal, labels, _ = recording_picker("viewer_rec")
 
-    # --- Discover PSG files ---
-    psg_pattern = os.path.join(DATA_RAW_DIR, "*-PSG.edf")
-    psg_files = sorted(glob.glob(psg_pattern))
+    total_seconds = len(signal) / SFREQ
+    metric_cards([
+        (name, "Recording"),
+        (f"{SFREQ} Hz", "Sampling Rate"),
+        (f"{total_seconds / 3600:.2f} hr ({total_seconds / 60:.0f} min)", "Duration"),
+    ], value_size="1.2rem")
+    st.markdown("")
 
-    if not psg_files:
-        demo_mode = True
-        st.warning("⚠️ **Demo Mode Active**: No raw EDF files found in `data/raw/`. Using a pre-extracted sample EEG (100 Hz, Fpz-Cz) for demonstration.")
-    else:
-        demo_mode = False
-
-    if demo_mode:
-        sample_path = os.path.join(os.path.dirname(__file__), "..", "data", "sample", "demo_eeg.npy")
-        if not os.path.exists(sample_path):
-            st.error("Demo sample file not found. Please ensure `data/sample/demo_eeg.npy` exists.")
-            return
-            
-        full_signal = np.load(sample_path)
-        sfreq = 100.0
-        total_seconds = len(full_signal) / sfreq
-        selected_name = "demo_eeg.npy"
-    else:
-        psg_basenames = [os.path.basename(f) for f in psg_files]
-
-        # --- File selector ---
-        st.markdown('<div class="section-header">📂 Select Recording</div>', unsafe_allow_html=True)
-        selected_name = st.selectbox(
-            "PSG recording",
-            options=psg_basenames,
-            index=0,
-            label_visibility="collapsed",
-        )
-        selected_path = psg_files[psg_basenames.index(selected_name)]
-
-        # --- Load EDF ---
-        try:
-            raw = load_raw_edf(selected_path)
-        except Exception as exc:
-            st.error(f"Failed to read EDF file: {exc}")
-            return
-
-        # --- Verify Fpz-Cz channel ---
-        if PREFERRED_CHANNEL not in raw.ch_names:
-            st.error(
-                f"Channel **{PREFERRED_CHANNEL}** not found in this recording.\n\n"
-                f"Available channels: {', '.join(raw.ch_names)}"
-            )
-            return
-
-        sfreq = raw.info["sfreq"]
-        total_seconds = raw.n_times / sfreq
-
-    total_minutes = total_seconds / 60
-    total_hours = total_minutes / 60
-
-    # --- Recording info cards ---
-    info_cols = st.columns(3)
-    info_items = [
-        (selected_name, "Recording"),
-        (f"{sfreq:.0f} Hz", "Sampling Rate"),
-        (f"{total_hours:.2f} hr ({total_minutes:.0f} min)", "Duration"),
-    ]
-    for col, (val, lbl) in zip(info_cols, info_items):
-        with col:
-            st.markdown(
-                f'<div class="metric-card">'
-                f'  <div class="metric-value" style="font-size:1.2rem">{val}</div>'
-                f'  <div class="metric-label">{lbl}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-    st.markdown("")  # spacer
-
-    # --- Time controls ---
-    st.markdown('<div class="section-header">🕐 Time Window</div>', unsafe_allow_html=True)
-
+    section("🕐 Time Window")
     ctrl_col1, ctrl_col2 = st.columns([3, 1])
-
     with ctrl_col1:
-        max_start = max(0.0, total_seconds - 5.0)
-        start_time = st.slider(
-            "Start time (seconds)",
-            min_value=0.0,
-            max_value=max_start,
-            value=0.0,
-            step=1.0,
-            format="%.0f s",
-        )
-
+        start_time = st.slider("Start time (seconds)", 0.0, max(0.0, total_seconds - 5.0),
+                               0.0, step=1.0, format="%.0f s")
     with ctrl_col2:
-        remaining = total_seconds - start_time
-        max_duration = min(30.0, remaining)
-        duration = st.slider(
-            "Display duration (seconds)",
-            min_value=5.0,
-            max_value=max_duration,
-            value=min(30.0, max_duration),
-            step=1.0,
-            format="%.0f s",
-        )
-
+        max_duration = max(5.0, min(30.0, total_seconds - start_time))
+        duration = st.slider("Display duration (seconds)", 5.0, max_duration,
+                             min(30.0, max_duration), step=1.0, format="%.0f s")
     end_time = start_time + duration
 
-    # --- Read only the selected window (memory efficient) ---
-    start_sample = int(start_time * sfreq)
-    stop_sample = int(end_time * sfreq)
+    start_sample, stop_sample = int(start_time * SFREQ), int(end_time * SFREQ)
+    eeg_uv = signal[start_sample:stop_sample] * 1e6
+    time_axis = start_time + np.arange(len(eeg_uv)) / SFREQ
 
-    try:
-        if demo_mode:
-            data = full_signal[start_sample:stop_sample]
-            eeg_signal = data * 1e6
-            time_axis = np.linspace(start_time, end_time, len(eeg_signal), endpoint=False)
-        else:
-            # Pick the Fpz-Cz channel and read only the needed segment
-            raw_pick = raw.copy().pick([PREFERRED_CHANNEL])
-            data, times = raw_pick[:, start_sample:stop_sample]
-            eeg_signal = data[0] * 1e6  # Convert V -> uV for readability
-            time_axis = times
-    except Exception as exc:
-        st.error(f"Error reading EEG data: {exc}")
-        return
+    stage_note = ""
+    if labels is not None:
+        epoch = int(start_time // EPOCH_SEC)
+        if epoch < len(labels) and labels[epoch] != UNSCORED:
+            stage_note = f" — expert stage at window start: **{CLASS_NAMES[labels[epoch]]}**"
 
-    # --- Plotly chart ---
-    st.markdown('<div class="section-header">📈 EEG Waveform (Fpz-Cz)</div>', unsafe_allow_html=True)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=time_axis,
-        y=eeg_signal,
-        mode="lines",
-        line=dict(color="#7c83ff", width=1),
-        name="Fpz-Cz",
-        hovertemplate="Time: %{x:.2f} s<br>Amplitude: %{y:.2f} uV<extra></extra>",
+    section("📈 EEG Waveform (Fpz-Cz)")
+    if stage_note:
+        st.markdown(stage_note)
+    fig = go.Figure(go.Scatter(
+        x=time_axis, y=eeg_uv, mode="lines", line=dict(color="#7c83ff", width=1), name="Fpz-Cz",
+        hovertemplate="Time: %{x:.2f} s<br>Amplitude: %{y:.2f} µV<extra></extra>",
     ))
-
-    fig.update_layout(
-        xaxis_title="Time (seconds)",
-        yaxis_title="EEG Amplitude (uV)",
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(30,30,47,0.6)",
-        height=420,
-        margin=dict(l=60, r=20, t=30, b=50),
-        xaxis=dict(
-            gridcolor="rgba(255,255,255,0.06)",
-            zeroline=False,
-        ),
-        yaxis=dict(
-            gridcolor="rgba(255,255,255,0.06)",
-            zeroline=True,
-            zerolinecolor="rgba(255,255,255,0.15)",
-        ),
-        hoverlabel=dict(bgcolor="#2d2d44"),
-    )
-
+    fig.update_layout(**PLOT_LAYOUT, height=420,
+                      xaxis_title="Time (seconds)", yaxis_title="EEG Amplitude (µV)")
     st.plotly_chart(fig, use_container_width=True)
+    st.caption(f"Showing {duration:.0f}s of EEG  |  Samples: {len(eeg_uv):,}  |  "
+               f"Range: {start_time:.0f}s - {end_time:.0f}s  |  "
+               f"Min: {eeg_uv.min():.2f} µV  |  Max: {eeg_uv.max():.2f} µV")
 
-    # --- Epoch info ---
-    n_samples_shown = len(eeg_signal)
-    st.caption(
-        f"Showing {duration:.0f}s of EEG  |  "
-        f"Samples: {n_samples_shown:,}  |  "
-        f"Range: {start_time:.0f}s - {end_time:.0f}s  |  "
-        f"Min: {eeg_signal.min():.2f} uV  |  "
-        f"Max: {eeg_signal.max():.2f} uV"
-    )
 
 # ---------------------------------------------------------------------------
 # Page: Sleep Stage Prediction
 # ---------------------------------------------------------------------------
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "best_model.pth")
-CLASS_NAMES = ["Wake", "N1", "N2", "N3", "REM"]
-CLASS_COLORS = ["#4fc3f7", "#7c83ff", "#ab47bc", "#5c6bc0", "#ef5350"]
-
-@st.cache_resource(show_spinner="Loading PyTorch Model...")
-def load_pytorch_model():
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
-    model = SleepCNN(n_classes=5)
-    checkpoint = torch.load(MODEL_PATH, map_location=torch.device('cpu'), weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    return model
-
 def page_prediction():
-    st.markdown('<div class="hero-title">Sleep Stage Prediction</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="hero-subtitle">'
-        'Run the lightweight 1D CNN inference on a selected 30-second EEG epoch.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    # --- Discover PSG files ---
-    psg_pattern = os.path.join(DATA_RAW_DIR, "*-PSG.edf")
-    psg_files = sorted(glob.glob(psg_pattern))
-
-    if not psg_files:
-        demo_mode = True
-        st.warning("⚠️ **Demo Mode Active**: No raw EDF files found in `data/raw/`. Using a pre-extracted sample EEG (100 Hz, Fpz-Cz) for demonstration.")
-    else:
-        demo_mode = False
-        psg_basenames = [os.path.basename(f) for f in psg_files]
-
-    # --- Load Model ---
+    header("Sleep Stage Prediction",
+           "Run the lightweight 1D CNN on a selected 30-second EEG epoch.")
     try:
-        model = load_pytorch_model()
+        get_model()
     except Exception as exc:
         st.error(f"Failed to load model: {exc}")
         return
 
-    st.markdown('<div class="section-header">📂 Select Recording & Epoch</div>', unsafe_allow_html=True)
+    section("📂 Select Recording & Epoch")
     col_file, col_epoch = st.columns([2, 1])
-    
     with col_file:
-        if demo_mode:
-            st.info("Using demo sample file: data/sample/demo_eeg.npy")
-            selected_name = "demo_eeg.npy"
-            
-            sample_path = os.path.join(os.path.dirname(__file__), "..", "data", "sample", "demo_eeg.npy")
-            if not os.path.exists(sample_path):
-                st.error("Demo sample file not found.")
-                return
-            full_signal = np.load(sample_path)
-            sfreq = 100.0
-            total_seconds = len(full_signal) / sfreq
-        else:
-            selected_name = st.selectbox("PSG recording", options=psg_basenames, index=0)
-            selected_path = psg_files[psg_basenames.index(selected_name)]
-            try:
-                raw = load_raw_edf(selected_path)
-            except Exception as exc:
-                st.error(f"Failed to read EDF file: {exc}")
-                return
-        
-            if PREFERRED_CHANNEL not in raw.ch_names:
-                st.error(f"Channel **{PREFERRED_CHANNEL}** not found in this recording.")
-                return
-        
-            sfreq = raw.info["sfreq"]
-            if sfreq != 100:
-                st.error(f"Expected 100 Hz sampling rate, got {sfreq} Hz.")
-                return
-                
-            total_seconds = raw.n_times / sfreq
+        name, signal, labels, _ = recording_picker("pred_rec")
+    n_epochs = len(signal) // EPOCH_SAMPLES
+    if n_epochs == 0:
+        st.error("Recording is shorter than one 30-second epoch.")
+        return
 
-    total_epochs = int(total_seconds // 30)
-
+    default_epoch = 0
+    if labels is not None:
+        sleep_idx = np.flatnonzero(sleep_period_mask(labels))
+        default_epoch = int(sleep_idx[0]) if len(sleep_idx) else 0
     with col_epoch:
-        epoch_idx = st.number_input("Epoch Number (30s)", min_value=0, max_value=max(0, total_epochs - 1), value=0)
+        epoch_idx = int(st.number_input("Epoch Number (30s)", min_value=0,
+                                        max_value=n_epochs - 1, value=default_epoch))
 
-    start_time = epoch_idx * 30.0
-    end_time = start_time + 30.0
-    start_sample = int(start_time * sfreq)
-    stop_sample = int(end_time * sfreq)
+    probs = predict_probs(name, signal)[epoch_idx]
+    pred = int(np.argmax(probs))
+    expert = int(labels[epoch_idx]) if labels is not None and epoch_idx < len(labels) else UNSCORED
 
-    # Read exactly one 30-second epoch
-    try:
-        if demo_mode:
-            eeg_signal = full_signal[start_sample:stop_sample]
-        else:
-            raw_pick = raw.copy().pick([PREFERRED_CHANNEL])
-            data, times = raw_pick[:, start_sample:stop_sample]
-            eeg_signal = data[0]
-    except Exception as exc:
-        st.error(f"Error reading EEG data: {exc}")
-        return
-
-    if len(eeg_signal) != 3000:
-        st.error(f"Incomplete epoch: got {len(eeg_signal)} samples, expected 3000.")
-        return
-
-    # Preprocessing: Z-score normalization
-    mean_val = np.mean(eeg_signal)
-    std_val = np.std(eeg_signal)
-    if std_val > 1e-8:
-        eeg_norm = (eeg_signal - mean_val) / std_val
-    else:
-        eeg_norm = eeg_signal - mean_val
-
-    # Inference
-    x_tensor = torch.tensor(eeg_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)  # (1, 1, 3000)
-    with torch.no_grad():
-        logits = model(x_tensor)
-        probs = F.softmax(logits, dim=1).squeeze(0).numpy()
-    
-    pred_class_idx = int(np.argmax(probs))
-    pred_class_name = CLASS_NAMES[pred_class_idx]
-    pred_confidence = probs[pred_class_idx] * 100
-
-    # Display Prediction Results
-    st.markdown('<div class="section-header">🎯 Prediction Results</div>', unsafe_allow_html=True)
-    
+    section("🎯 Prediction Results")
     res_col1, res_col2 = st.columns([1, 2])
     with res_col1:
+        color = CLASS_COLORS[pred]
         st.markdown(
-            f'<div class="metric-card" style="border-top: 4px solid {CLASS_COLORS[pred_class_idx]}">'
-            f'  <div class="metric-value" style="color: {CLASS_COLORS[pred_class_idx]}">{pred_class_name}</div>'
-            f'  <div class="metric-label">Predicted Stage</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="metric-card" style="margin-top:1rem;">'
-            f'  <div class="metric-value">{pred_confidence:.1f}%</div>'
-            f'  <div class="metric-label">Confidence</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-        
+            f'<div class="metric-card" style="border-top: 4px solid {color}">'
+            f'<div class="metric-value" style="color: {color}">{CLASS_NAMES[pred]}</div>'
+            f'<div class="metric-label">Predicted Stage · {probs[pred] * 100:.1f}% confidence</div>'
+            f'</div>', unsafe_allow_html=True)
+        if expert != UNSCORED:
+            verdict = "✅ matches" if expert == pred else "❌ differs from"
+            st.markdown(
+                f'<div class="metric-card" style="margin-top:1rem;">'
+                f'<div class="metric-value">{CLASS_NAMES[expert]}</div>'
+                f'<div class="metric-label">Expert label — prediction {verdict} it</div>'
+                f'</div>', unsafe_allow_html=True)
     with res_col2:
-        # Probability Bar Chart
         fig_bar = go.Figure(go.Bar(
-            x=probs * 100,
-            y=CLASS_NAMES,
-            orientation='h',
-            marker_color=CLASS_COLORS,
-            text=[f"{p*100:.1f}%" for p in probs],
-            textposition='auto',
+            x=probs * 100, y=CLASS_NAMES, orientation="h", marker_color=CLASS_COLORS,
+            text=[f"{p * 100:.1f}%" for p in probs], textposition="auto",
         ))
-        fig_bar.update_layout(
-            title="Class Probabilities",
-            xaxis_title="Probability (%)",
-            yaxis_title="Stage",
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(30,30,47,0.6)",
-            height=200,
-            margin=dict(l=60, r=20, t=30, b=30),
-            xaxis=dict(range=[0, 100])
-        )
+        fig_bar.update_layout(**PLOT_LAYOUT, title="Class Probabilities", height=240,
+                              xaxis_title="Probability (%)")
+        fig_bar.update_xaxes(range=[0, 100])
         st.plotly_chart(fig_bar, use_container_width=True)
 
-    # Display Waveform
-    st.markdown(f'<div class="section-header">📈 Epoch {epoch_idx} Waveform ({start_time:.0f}s - {end_time:.0f}s)</div>', unsafe_allow_html=True)
-    
-    fig_wave = go.Figure()
-    fig_wave.add_trace(go.Scatter(
-        x=np.linspace(start_time, end_time, 3000),
-        y=eeg_signal * 1e6, # Plot in uV
-        mode="lines",
-        line=dict(color="#7c83ff", width=1),
-        name="Fpz-Cz",
-    ))
-
-    fig_wave.update_layout(
-        xaxis_title="Time (seconds)",
-        yaxis_title="EEG Amplitude (uV)",
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(30,30,47,0.6)",
-        height=300,
-        margin=dict(l=60, r=20, t=30, b=50),
-    )
+    start_time = epoch_idx * EPOCH_SEC
+    epoch_signal = signal[epoch_idx * EPOCH_SAMPLES:(epoch_idx + 1) * EPOCH_SAMPLES]
+    section(f"📈 Epoch {epoch_idx} Waveform ({start_time}s - {start_time + EPOCH_SEC}s)")
+    fig_wave = go.Figure(go.Scatter(
+        x=start_time + np.arange(EPOCH_SAMPLES) / SFREQ, y=epoch_signal * 1e6,
+        mode="lines", line=dict(color="#7c83ff", width=1), name="Fpz-Cz"))
+    fig_wave.update_layout(**PLOT_LAYOUT, height=300,
+                           xaxis_title="Time (seconds)", yaxis_title="EEG Amplitude (µV)")
     st.plotly_chart(fig_wave, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
 # Page: Overnight Hypnogram
 # ---------------------------------------------------------------------------
+def summary_table(pred_summary, expert_summary=None):
+    rows = [
+        ("Time in bed", "time_in_bed_min"),
+        ("Total sleep time", "total_sleep_time_min"),
+        ("Sleep onset latency", "sleep_onset_latency_min"),
+        ("Wake after sleep onset (WASO)", "waso_min"),
+        ("REM latency", "rem_latency_min"),
+    ]
+    header_row = "| Measure | CNN prediction |" + (" Expert |" if expert_summary else "")
+    lines = [header_row, "|---|---:|" + ("---:|" if expert_summary else "")]
+    for label, key in rows:
+        line = f"| {label} | {fmt_min(pred_summary[key])} |"
+        if expert_summary:
+            line += f" {fmt_min(expert_summary[key])} |"
+        lines.append(line)
+    line = f"| Sleep efficiency | {pred_summary['sleep_efficiency_pct']:.1f}% |"
+    if expert_summary:
+        line += f" {expert_summary['sleep_efficiency_pct']:.1f}% |"
+    lines.append(line)
+    for i, stage in enumerate(CLASS_NAMES[1:], start=1):
+        line = f"| {stage} time | {pred_summary['stage_minutes'][stage]:.0f} min |"
+        if expert_summary:
+            line += f" {expert_summary['stage_minutes'][stage]:.0f} min |"
+        lines.append(line)
+    st.markdown("\n".join(lines))
+
+
 def page_hypnogram():
-    st.markdown('<div class="hero-title">Overnight Hypnogram</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="hero-subtitle">'
-        'Full night sleep stage prediction using the trained lightweight CNN.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-    
-    st.info("Predictions are generated by the trained CNN from EEG signals. They are not the expert annotation labels.")
-
-    # --- Discover PSG files ---
-    psg_pattern = os.path.join(DATA_RAW_DIR, "*-PSG.edf")
-    psg_files = sorted(glob.glob(psg_pattern))
-
-    if not psg_files:
-        demo_mode = True
-        st.warning("⚠️ **Demo Mode Active**: No raw EDF files found in `data/raw/`. Using a pre-extracted sample EEG (100 Hz, Fpz-Cz) for demonstration.")
-    else:
-        demo_mode = False
-        psg_basenames = [os.path.basename(f) for f in psg_files]
-
-    # --- Load Model ---
+    header("Overnight Hypnogram",
+           "Full-night sleep staging by the lightweight CNN, compared with the expert scoring.")
     try:
-        model = load_pytorch_model()
+        get_model()
     except Exception as exc:
         st.error(f"Failed to load model: {exc}")
         return
 
-    st.markdown('<div class="section-header">📂 Select Recording</div>', unsafe_allow_html=True)
-    if demo_mode:
-        st.info("Using demo sample file: data/sample/demo_eeg.npy")
-        selected_name = "demo_eeg.npy"
-    else:
-        selected_name = st.selectbox("PSG recording", options=psg_basenames, index=0)
-        selected_path = psg_files[psg_basenames.index(selected_name)]
-    
-    if st.button("Generate Hypnogram", type="primary"):
-        with st.spinner("Processing recording and running inference..."):
-            try:
-                if demo_mode:
-                    sample_path = os.path.join(os.path.dirname(__file__), "..", "data", "sample", "demo_eeg.npy")
-                    if not os.path.exists(sample_path):
-                        st.error("Demo sample file not found.")
-                        return
-                    data = np.load(sample_path)
-                else:
-                    raw = load_raw_edf(selected_path)
-                    if PREFERRED_CHANNEL not in raw.ch_names:
-                        st.error(f"Channel **{PREFERRED_CHANNEL}** not found.")
-                        return
-                    
-                    sfreq = raw.info["sfreq"]
-                    if sfreq != 100:
-                        st.error(f"Expected 100 Hz sampling rate, got {sfreq} Hz.")
-                        return
-                    
-                    # Load data
-                    raw_pick = raw.copy().pick([PREFERRED_CHANNEL])
-                    raw_pick.load_data()
-                    data = raw_pick.get_data()[0]
-                    
-                total_samples = len(data)
-                
-                epoch_samples = 3000
-                n_epochs = total_samples // epoch_samples
-                
-                if n_epochs == 0:
-                    st.error("Recording is too short for a single epoch.")
-                    return
-                    
-                # Reshape data into epochs
-                epochs_data = data[:n_epochs * epoch_samples].reshape(n_epochs, epoch_samples)
-                
-                # Z-score normalization
-                means = np.mean(epochs_data, axis=1, keepdims=True)
-                stds = np.std(epochs_data, axis=1, keepdims=True)
-                stds[stds < 1e-8] = 1.0  # Avoid division by zero
-                epochs_norm = (epochs_data - means) / stds
-                
-                # Inference in batches to avoid OOM
-                batch_size = 128
-                all_preds = []
-                
-                with torch.no_grad():
-                    for i in range(0, n_epochs, batch_size):
-                        batch = epochs_norm[i:i+batch_size]
-                        x_tensor = torch.tensor(batch, dtype=torch.float32).unsqueeze(1) # (B, 1, 3000)
-                        logits = model(x_tensor)
-                        probs = F.softmax(logits, dim=1)
-                        preds = torch.argmax(probs, dim=1).numpy()
-                        all_preds.extend(preds)
-                        
-                all_preds = np.array(all_preds)
-                time_hours = np.arange(n_epochs) * 30 / 3600.0
-                
-                # Display summary info
-                st.markdown('<div class="section-header">📊 Recording Summary</div>', unsafe_allow_html=True)
-                info_cols = st.columns(3)
-                duration_hours = n_epochs * 30 / 3600.0
-                
-                with info_cols[0]:
-                    st.metric("Recording", selected_name)
-                with info_cols[1]:
-                    st.metric("Duration", f"{duration_hours:.2f} hours")
-                with info_cols[2]:
-                    st.metric("Analyzed Epochs", f"{n_epochs:,}")
-                
-                # Calculate class distributions
-                counts = np.bincount(all_preds, minlength=5)
-                percentages = counts / n_epochs * 100
-                
-                dist_cols = st.columns(5)
-                for i in range(5):
-                    with dist_cols[i]:
-                        st.metric(CLASS_NAMES[i], f"{counts[i]} ({percentages[i]:.1f}%)")
-                
-                # Plotly Hypnogram
-                st.markdown('<div class="section-header">🌙 Hypnogram</div>', unsafe_allow_html=True)
-                
-                # Y-axis mapping to achieve Wake, REM, N1, N2, N3 order (Wake=4, REM=3, N1=2, N2=1, N3=0)
-                stage_map = {0: 4, 4: 3, 1: 2, 2: 1, 3: 0}
-                y_mapped = np.array([stage_map[p] for p in all_preds])
-                
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=time_hours,
-                    y=y_mapped,
-                    mode='lines',
-                    line=dict(color="#7c83ff", shape='hv'),
-                    name='Sleep Stage'
-                ))
-                
-                fig.update_layout(
-                    xaxis_title="Time (hours)",
-                    yaxis_title="Sleep Stage",
-                    yaxis=dict(
-                        tickmode='array',
-                        tickvals=[4, 3, 2, 1, 0],
-                        ticktext=['Wake', 'REM', 'N1', 'N2', 'N3'],
-                    ),
-                    template="plotly_dark",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(30,30,47,0.6)",
-                    height=400,
-                    margin=dict(l=60, r=20, t=30, b=50),
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-                
-            except Exception as exc:
-                st.error(f"Error processing recording: {exc}")
+    section("📂 Select Recording")
+    name, signal, labels, _ = recording_picker("hyp_rec")
+    probs = predict_probs(name, signal)
+    predicted = probs.argmax(axis=1)
+    if len(predicted) == 0:
+        st.error("Recording is shorter than one 30-second epoch.")
+        return
+
+    expert = labels[:len(predicted)] if labels is not None else None
+    window = np.ones(len(predicted), dtype=bool)
+    if expert is not None:
+        only_sleep = st.checkbox("Show sleep period only (±30 min of Wake around sleep)",
+                                 value=True)
+        if only_sleep and sleep_period_mask(expert).any():
+            window = sleep_period_mask(expert)
+    idx = np.flatnonzero(window)
+    pred_w = predicted[idx]
+    exp_w = expert[idx] if expert is not None else None
+    hours = idx * EPOCH_SEC / 3600.0
+
+    if exp_w is not None:
+        scored = exp_w != UNSCORED
+        m = compute_metrics(exp_w[scored], pred_w[scored])
+        section("🎯 Agreement with Expert Scoring")
+        metric_cards([
+            (f"{100 * m['accuracy']:.1f}%", "Epoch Agreement"),
+            (f"{m['cohen_kappa']:.3f}", "Cohen's κ"),
+            (f"{m['macro_f1']:.3f}", "Macro-F1"),
+            (f"{int(scored.sum()):,}", "Scored Epochs"),
+        ])
+        st.markdown("")
+
+    section("🌙 Hypnogram")
+    st.caption("Grey: expert hypnogram. Purple: CNN prediction, one 30-second epoch at a time.")
+    placeholder = st.empty()
+    placeholder.plotly_chart(hypnogram_figure(hours, pred_w, exp_w), use_container_width=True)
+
+    with st.expander("▶ Overnight streaming simulation"):
+        st.markdown("Replays the night epoch by epoch, as an overnight monitor would see it.")
+        speed = st.select_slider("Replay speed (epochs per frame)", options=[5, 10, 20, 40, 80],
+                                 value=20)
+        if st.button("Start simulation", type="primary"):
+            x_max = hours[-1] if len(hours) else 1
+            status = st.empty()
+            for end in range(speed, len(idx) + speed, speed):
+                end = min(end, len(idx))
+                placeholder.plotly_chart(
+                    hypnogram_figure(hours[:end], pred_w[:end],
+                                     exp_w[:end] if exp_w is not None else None, x_max=x_max),
+                    use_container_width=True, key=f"stream_{end}")
+                current = CLASS_NAMES[int(pred_w[end - 1])]
+                status.markdown(f"**t = {hours[end - 1]:.2f} h** · epoch {int(idx[end - 1])} "
+                                f"· predicted stage **{current}**")
+                time.sleep(0.05)
+
+    section("🛏️ Sleep Architecture")
+    pred_summary = sleep_summary(pred_w)
+    expert_summary = None
+    if exp_w is not None:
+        expert_summary = sleep_summary(np.where(exp_w == UNSCORED, 0, exp_w))
+    summary_table(pred_summary, expert_summary)
 
 
 # ---------------------------------------------------------------------------
 # Page: Model Performance
 # ---------------------------------------------------------------------------
 def page_performance():
-    st.markdown('<div class="hero-title">Model Performance</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="hero-subtitle">'
-        'Evaluation results on the completely unseen test subject (SC4022).'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+    header("Model Performance", "Evaluation on subjects never seen during training "
+                                "or model selection.")
+    m = load_json(TEST_METRICS_PATH)
+    if m is None:
+        st.warning("No evaluation results found. Run `python src/evaluate.py` first.")
+        return
 
-    # --- Summary Metrics ---
-    st.markdown('<div class="section-header">📊 Overall Test Metrics</div>', unsafe_allow_html=True)
-    cols = st.columns(4)
-    metrics = [
-        ("89.00%", "Test Accuracy"),
-        ("69.22%", "Macro-F1 Score"),
-        ("SC4022", "Test Subject"),
-        ("2,755", "Test Epochs"),
-    ]
-    for col, (value, label) in zip(cols, metrics):
-        with col:
-            st.markdown(
-                f'<div class="metric-card">'
-                f'  <div class="metric-value">{value}</div>'
-                f'  <div class="metric-label">{label}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-    st.markdown("")  # spacer
+    section("📊 Held-out Test Subjects")
+    metric_cards([
+        (f"{m['macro_f1']:.3f}", "Macro-F1"),
+        (f"{m['cohen_kappa']:.3f}", "Cohen's κ"),
+        (f"{100 * m['accuracy']:.1f}%", f"Accuracy (baseline {100 * m['majority_class_baseline']:.0f}%)"),
+        (", ".join(map(str, m["test_subjects"])), f"Test Subjects · {m['n_epochs']:,} epochs"),
+    ])
+    st.caption("The baseline is the accuracy of always predicting the most common stage; "
+               "macro-F1 and Cohen's κ are the fairer measures for imbalanced sleep data.")
+    st.markdown("")
 
     col_cm, col_table = st.columns([1.2, 1])
-
     with col_cm:
-        st.markdown('<div class="section-header">🔲 Confusion Matrix</div>', unsafe_allow_html=True)
-        st.markdown(
-            "The confusion matrix compares the actual expert-annotated sleep stages (Y-axis) "
-            "with the stages predicted by the CNN model (X-axis)."
-        )
-
-        cm_data = [
-            [1858,    5,    0,    0,    8],
-            [   7,   64,   66,   18,   29],
-            [   0,    1,  327,   74,    0],
-            [   0,    0,    0,  119,    0],
-            [   7,   38,   27,   23,   84]
-        ]
-        classes = ["Wake", "N1", "N2", "N3", "REM"]
-
-        fig_cm = go.Figure(data=go.Heatmap(
-            z=cm_data,
-            x=classes,
-            y=classes,
-            hoverongaps=False,
-            colorscale='Blues',
-            text=cm_data,
-            texttemplate="%{text}",
-            textfont={"size": 14}
-        ))
-        
-        # Reverse y-axis to match typical matrix representation
-        fig_cm.update_layout(
-            xaxis_title="Predicted Stage",
-            yaxis_title="Actual Stage",
-            yaxis=dict(autorange="reversed"),
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(30,30,47,0.6)",
-            height=400,
-            margin=dict(l=50, r=20, t=30, b=50),
-        )
+        section("🔲 Confusion Matrix")
+        normalized = st.toggle("Show row percentages (recall per stage)", value=True)
+        z = np.array(m["confusion_matrix_normalized"]) * 100 if normalized \
+            else np.array(m["confusion_matrix"])
+        text = [[f"{v:.1f}%" if normalized else f"{int(v)}" for v in row] for row in z]
+        fig_cm = go.Figure(go.Heatmap(z=z, x=CLASS_NAMES, y=CLASS_NAMES, colorscale="Blues",
+                                      text=text, texttemplate="%{text}",
+                                      textfont={"size": 14}, hoverongaps=False))
+        fig_cm.update_layout(**PLOT_LAYOUT, height=420)
+        fig_cm.update_xaxes(title="Predicted Stage")
+        fig_cm.update_yaxes(title="Expert Stage", autorange="reversed")
         st.plotly_chart(fig_cm, use_container_width=True)
-
     with col_table:
-        st.markdown('<div class="section-header">📈 Per-Class Performance</div>', unsafe_allow_html=True)
-        
-        # Create a markdown table
-        st.markdown("""
-        | Stage | Precision | Recall | F1-Score | Support |
-        |-------|-----------|--------|----------|---------|
-        | **Wake** | 99.25% | 99.31% | 99.28% | 1,871 |
-        | **N1** | 59.26% | 34.78% | 43.84% | 184 |
-        | **N2** | 77.86% | 81.34% | 79.56% | 402 |
-        | **N3** | 50.85% | 100.00% | 67.42% | 119 |
-        | **REM** | 69.42% | 46.93% | 56.00% | 179 |
-        """)
-        
-        st.markdown('<div class="section-header" style="margin-top:2rem;">🤖 Model Info</div>', unsafe_allow_html=True)
-        st.markdown("""
-        - **Lightweight 1D CNN** architecture
-        - **174,597** trainable parameters
-        - Approximately **0.67 MB** parameter size
-        - 3 convolutional blocks
-        - MaxPool + **Global Average Pooling**
-        - Dense(128) → Dropout(0.5) → Dense(5)
-        """)
+        section("📈 Per-Class Performance")
+        lines = ["| Stage | Precision | Recall | F1 | Support |", "|---|---:|---:|---:|---:|"]
+        for name in CLASS_NAMES:
+            c = m["per_class"][name]
+            lines.append(f"| **{name}** | {100 * c['precision']:.1f}% | {100 * c['recall']:.1f}% "
+                         f"| {100 * c['f1']:.1f}% | {c['support']:,} |")
+        st.markdown("\n".join(lines))
 
+        section("🔀 Most Frequent Confusions")
+        for c in m["top_confusions"][:5]:
+            st.markdown(f"- **{c['true']} → {c['predicted']}**: {c['count']} epochs "
+                        f"({100 * c['rate']:.1f}% of {c['true']})")
 
-# ---------------------------------------------------------------------------
-# Page: Placeholder pages
+    st.markdown("")
+    col_n1, col_tr = st.columns(2)
+    with col_n1:
+        section("🧩 N1 / REM Focus")
+        focus = m["n1_rem_focus"]
+        fig = go.Figure()
+        for stage, key in (("N1", "n1_predicted_as"), ("REM", "rem_predicted_as")):
+            targets = list(focus[key])
+            fig.add_trace(go.Bar(name=f"True {stage}", x=targets,
+                                 y=[100 * focus[key][t] for t in targets]))
+        fig.update_layout(**PLOT_LAYOUT, barmode="group", height=320,
+                          yaxis_title="% of true-stage epochs", xaxis_title="Predicted as")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(f"N1 recall {100 * focus['n1_recall']:.1f}% · REM recall "
+                   f"{100 * focus['rem_recall']:.1f}%. N1 is the hardest stage for human "
+                   "scorers too; it is mostly confused with its neighbours on the hypnogram.")
+    with col_tr:
+        section("↕️ Stage-Transition Analysis")
+        t = m["transition_analysis"]
+        groups = [("Stable epochs", t["stable"]), ("Near a stage change", t["near_transition"])]
+        fig = go.Figure()
+        for metric, label in (("accuracy", "Accuracy"), ("macro_f1", "Macro-F1")):
+            fig.add_trace(go.Bar(name=label, x=[g[0] for g in groups],
+                                 y=[100 * g[1].get(metric, 0) for g in groups]))
+        fig.update_layout(**PLOT_LAYOUT, barmode="group", height=320, yaxis_title="%")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(f"{t['near_transition']['n_epochs']:,} of {m['n_epochs']:,} test epochs sit "
+                   "next to an expert-scored stage change, where even human scorers disagree most.")
 
-# ---------------------------------------------------------------------------
-def page_placeholder(name: str):
-    st.markdown(
-        f'<div class="hero-title">{name}</div>',
-        unsafe_allow_html=True,
-    )
-    st.info(
-        f"🚧 The {name} page is under construction and will be implemented soon."
-    )
+    cv = load_json(CV_METRICS_PATH)
+    if cv:
+        st.markdown("")
+        section(f"🔁 {cv['n_folds']}-Fold Subject-Grouped Cross-Validation")
+        metric_cards([
+            (f"{cv['macro_f1']['mean']:.3f} ± {cv['macro_f1']['std']:.3f}", "Macro-F1"),
+            (f"{cv['cohen_kappa']['mean']:.3f} ± {cv['cohen_kappa']['std']:.3f}", "Cohen's κ"),
+            (f"{100 * cv['accuracy']['mean']:.1f} ± {100 * cv['accuracy']['std']:.1f}%", "Accuracy"),
+            (str(cv["n_subjects"]), "Subjects (each tested once)"),
+        ], value_size="1.3rem")
+        lines = ["| Fold | Test subjects | Accuracy | Macro-F1 | κ |", "|---|---|---:|---:|---:|"]
+        for f in cv["folds"]:
+            lines.append(f"| {f['fold']} | {', '.join(map(str, f['test_subjects']))} | "
+                         f"{100 * f['accuracy']:.1f}% | {f['macro_f1']:.3f} | {f['cohen_kappa']:.3f} |")
+        st.markdown("\n".join(lines))
+
+    section("🤖 Model Info")
+    mdl = m["model"]
+    st.markdown(f"- **{mdl['parameters']:,}** trainable parameters (~{mdl['size_mb']:.2f} MB)\n"
+                f"- **{mdl['macs_per_epoch'] / 1e6:.1f} M** multiply-accumulates per 30-s epoch\n"
+                f"- Checkpoint selected at epoch {m['checkpoint_epoch']} by validation macro-F1 "
+                f"({m['val_macro_f1']:.3f}) on subjects {', '.join(map(str, m['val_subjects']))}")
 
 
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
-if page == "Overview":
-    page_overview()
-elif page == "EEG Signal Viewer":
-    page_eeg_viewer()
-elif page == "Sleep Stage Prediction":
-    page_prediction()
-elif page == "Overnight Hypnogram":
-    page_hypnogram()
-elif page == "Model Performance":
-    page_performance()
-
+PAGES = {
+    "Overview": page_overview,
+    "EEG Signal Viewer": page_eeg_viewer,
+    "Sleep Stage Prediction": page_prediction,
+    "Overnight Hypnogram": page_hypnogram,
+    "Model Performance": page_performance,
+}
+PAGES[page]()

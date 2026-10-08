@@ -1,0 +1,7 @@
+{
+  "source": "SC4071E0-PSG.edf (test subject 7), epochs 873-1352, starting 30 min before sleep onset",
+  "recording": "SC4071E0-PSG.edf",
+  "subject": 7,
+  "start_epoch": 873,
+  "n_epochs": 480
+}

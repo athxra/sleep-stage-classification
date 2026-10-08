@@ -1,36 +1,601 @@
 {
-  "strategy": "subject-independent (LOSO)",
-  "train": {
-    "subjects": [
-      0,
-      1,
-      2,
-      3
-    ],
-    "files": [
-      "SC4001E0-PSG.edf",
-      "SC4002E0-PSG.edf",
-      "SC4011E0-PSG.edf",
-      "SC4012E0-PSG.edf"
-    ],
-    "n_epochs": 11129
+  "strategy": "subject-grouped k-fold (both nights of a subject in the same split)",
+  "wake_edge_min": 30,
+  "n_epochs": 40274,
+  "n_subjects": 20,
+  "class_counts": {
+    "Wake": 7783,
+    "N1": 2595,
+    "N2": 16908,
+    "N3": 5638,
+    "REM": 7350
   },
-  "val": {
-    "subjects": [
-      4
-    ],
-    "files": [
-      "SC4021E0-PSG.edf"
-    ],
-    "n_epochs": 2804
-  },
-  "test": {
-    "subjects": [
-      5
-    ],
-    "files": [
-      "SC4022E0-PSG.edf"
-    ],
-    "n_epochs": 2755
-  }
+  "recordings": [
+    {
+      "id": 0,
+      "psg": "SC4001E0-PSG.edf",
+      "hypnogram": "SC4001EC-Hypnogram.edf",
+      "subject": 0,
+      "night": 1,
+      "grid_epochs": 2650,
+      "unscored": 0,
+      "trimmed_wake": 1809,
+      "kept": 841
+    },
+    {
+      "id": 1,
+      "psg": "SC4002E0-PSG.edf",
+      "hypnogram": "SC4002EC-Hypnogram.edf",
+      "subject": 0,
+      "night": 2,
+      "grid_epochs": 2830,
+      "unscored": 1,
+      "trimmed_wake": 1702,
+      "kept": 1127
+    },
+    {
+      "id": 2,
+      "psg": "SC4011E0-PSG.edf",
+      "hypnogram": "SC4011EH-Hypnogram.edf",
+      "subject": 1,
+      "night": 1,
+      "grid_epochs": 2802,
+      "unscored": 0,
+      "trimmed_wake": 1699,
+      "kept": 1103
+    },
+    {
+      "id": 3,
+      "psg": "SC4012E0-PSG.edf",
+      "hypnogram": "SC4012EC-Hypnogram.edf",
+      "subject": 1,
+      "night": 2,
+      "grid_epochs": 2850,
+      "unscored": 2,
+      "trimmed_wake": 1662,
+      "kept": 1186
+    },
+    {
+      "id": 4,
+      "psg": "SC4021E0-PSG.edf",
+      "hypnogram": "SC4021EH-Hypnogram.edf",
+      "subject": 2,
+      "night": 1,
+      "grid_epochs": 2804,
+      "unscored": 0,
+      "trimmed_wake": 1779,
+      "kept": 1025
+    },
+    {
+      "id": 5,
+      "psg": "SC4022E0-PSG.edf",
+      "hypnogram": "SC4022EJ-Hypnogram.edf",
+      "subject": 2,
+      "night": 2,
+      "grid_epochs": 2756,
+      "unscored": 1,
+      "trimmed_wake": 1746,
+      "kept": 1009
+    },
+    {
+      "id": 6,
+      "psg": "SC4031E0-PSG.edf",
+      "hypnogram": "SC4031EC-Hypnogram.edf",
+      "subject": 3,
+      "night": 1,
+      "grid_epochs": 2820,
+      "unscored": 0,
+      "trimmed_wake": 1868,
+      "kept": 952
+    },
+    {
+      "id": 7,
+      "psg": "SC4032E0-PSG.edf",
+      "hypnogram": "SC4032EP-Hypnogram.edf",
+      "subject": 3,
+      "night": 2,
+      "grid_epochs": 2732,
+      "unscored": 0,
+      "trimmed_wake": 1821,
+      "kept": 911
+    },
+    {
+      "id": 8,
+      "psg": "SC4041E0-PSG.edf",
+      "hypnogram": "SC4041EC-Hypnogram.edf",
+      "subject": 4,
+      "night": 1,
+      "grid_epochs": 2570,
+      "unscored": 1,
+      "trimmed_wake": 1334,
+      "kept": 1235
+    },
+    {
+      "id": 9,
+      "psg": "SC4042E0-PSG.edf",
+      "hypnogram": "SC4042EC-Hypnogram.edf",
+      "subject": 4,
+      "night": 2,
+      "grid_epochs": 2792,
+      "unscored": 4,
+      "trimmed_wake": 1588,
+      "kept": 1200
+    },
+    {
+      "id": 10,
+      "psg": "SC4051E0-PSG.edf",
+      "hypnogram": "SC4051EC-Hypnogram.edf",
+      "subject": 5,
+      "night": 1,
+      "grid_epochs": 2722,
+      "unscored": 0,
+      "trimmed_wake": 2050,
+      "kept": 672
+    },
+    {
+      "id": 11,
+      "psg": "SC4052E0-PSG.edf",
+      "hypnogram": "SC4052EC-Hypnogram.edf",
+      "subject": 5,
+      "night": 2,
+      "grid_epochs": 1689,
+      "unscored": 2,
+      "trimmed_wake": 1021,
+      "kept": 666
+    },
+    {
+      "id": 12,
+      "psg": "SC4061E0-PSG.edf",
+      "hypnogram": "SC4061EC-Hypnogram.edf",
+      "subject": 6,
+      "night": 1,
+      "grid_epochs": 2770,
+      "unscored": 0,
+      "trimmed_wake": 1927,
+      "kept": 843
+    },
+    {
+      "id": 13,
+      "psg": "SC4062E0-PSG.edf",
+      "hypnogram": "SC4062EC-Hypnogram.edf",
+      "subject": 6,
+      "night": 2,
+      "grid_epochs": 1450,
+      "unscored": 0,
+      "trimmed_wake": 787,
+      "kept": 663
+    },
+    {
+      "id": 14,
+      "psg": "SC4071E0-PSG.edf",
+      "hypnogram": "SC4071EC-Hypnogram.edf",
+      "subject": 7,
+      "night": 1,
+      "grid_epochs": 2810,
+      "unscored": 0,
+      "trimmed_wake": 1834,
+      "kept": 976
+    },
+    {
+      "id": 15,
+      "psg": "SC4072E0-PSG.edf",
+      "hypnogram": "SC4072EH-Hypnogram.edf",
+      "subject": 7,
+      "night": 2,
+      "grid_epochs": 1620,
+      "unscored": 0,
+      "trimmed_wake": 580,
+      "kept": 1040
+    },
+    {
+      "id": 16,
+      "psg": "SC4081E0-PSG.edf",
+      "hypnogram": "SC4081EC-Hypnogram.edf",
+      "subject": 8,
+      "night": 1,
+      "grid_epochs": 1707,
+      "unscored": 0,
+      "trimmed_wake": 743,
+      "kept": 964
+    },
+    {
+      "id": 17,
+      "psg": "SC4082E0-PSG.edf",
+      "hypnogram": "SC4082EP-Hypnogram.edf",
+      "subject": 8,
+      "night": 2,
+      "grid_epochs": 2634,
+      "unscored": 0,
+      "trimmed_wake": 1580,
+      "kept": 1054
+    },
+    {
+      "id": 18,
+      "psg": "SC4091E0-PSG.edf",
+      "hypnogram": "SC4091EC-Hypnogram.edf",
+      "subject": 9,
+      "night": 1,
+      "grid_epochs": 2732,
+      "unscored": 11,
+      "trimmed_wake": 1589,
+      "kept": 1132
+    },
+    {
+      "id": 19,
+      "psg": "SC4092E0-PSG.edf",
+      "hypnogram": "SC4092EC-Hypnogram.edf",
+      "subject": 9,
+      "night": 2,
+      "grid_epochs": 2858,
+      "unscored": 814,
+      "trimmed_wake": 940,
+      "kept": 1104
+    },
+    {
+      "id": 20,
+      "psg": "SC4101E0-PSG.edf",
+      "hypnogram": "SC4101EC-Hypnogram.edf",
+      "subject": 10,
+      "night": 1,
+      "grid_epochs": 1500,
+      "unscored": 0,
+      "trimmed_wake": 702,
+      "kept": 798
+    },
+    {
+      "id": 21,
+      "psg": "SC4102E0-PSG.edf",
+      "hypnogram": "SC4102EC-Hypnogram.edf",
+      "subject": 10,
+      "night": 2,
+      "grid_epochs": 1522,
+      "unscored": 1,
+      "trimmed_wake": 820,
+      "kept": 701
+    },
+    {
+      "id": 22,
+      "psg": "SC4111E0-PSG.edf",
+      "hypnogram": "SC4111EC-Hypnogram.edf",
+      "subject": 11,
+      "night": 1,
+      "grid_epochs": 2642,
+      "unscored": 1,
+      "trimmed_wake": 1713,
+      "kept": 928
+    },
+    {
+      "id": 23,
+      "psg": "SC4112E0-PSG.edf",
+      "hypnogram": "SC4112EC-Hypnogram.edf",
+      "subject": 11,
+      "night": 2,
+      "grid_epochs": 2780,
+      "unscored": 0,
+      "trimmed_wake": 1978,
+      "kept": 802
+    },
+    {
+      "id": 24,
+      "psg": "SC4121E0-PSG.edf",
+      "hypnogram": "SC4121EC-Hypnogram.edf",
+      "subject": 12,
+      "night": 1,
+      "grid_epochs": 2786,
+      "unscored": 101,
+      "trimmed_wake": 1633,
+      "kept": 1052
+    },
+    {
+      "id": 25,
+      "psg": "SC4122E0-PSG.edf",
+      "hypnogram": "SC4122EV-Hypnogram.edf",
+      "subject": 12,
+      "night": 2,
+      "grid_epochs": 2606,
+      "unscored": 0,
+      "trimmed_wake": 1629,
+      "kept": 977
+    },
+    {
+      "id": 26,
+      "psg": "SC4131E0-PSG.edf",
+      "hypnogram": "SC4131EC-Hypnogram.edf",
+      "subject": 13,
+      "night": 1,
+      "grid_epochs": 2814,
+      "unscored": 0,
+      "trimmed_wake": 1786,
+      "kept": 1028
+    },
+    {
+      "id": 27,
+      "psg": "SC4141E0-PSG.edf",
+      "hypnogram": "SC4141EU-Hypnogram.edf",
+      "subject": 14,
+      "night": 1,
+      "grid_epochs": 2756,
+      "unscored": 0,
+      "trimmed_wake": 1752,
+      "kept": 1004
+    },
+    {
+      "id": 28,
+      "psg": "SC4142E0-PSG.edf",
+      "hypnogram": "SC4142EU-Hypnogram.edf",
+      "subject": 14,
+      "night": 2,
+      "grid_epochs": 2774,
+      "unscored": 0,
+      "trimmed_wake": 1822,
+      "kept": 952
+    },
+    {
+      "id": 29,
+      "psg": "SC4151E0-PSG.edf",
+      "hypnogram": "SC4151EC-Hypnogram.edf",
+      "subject": 15,
+      "night": 1,
+      "grid_epochs": 2620,
+      "unscored": 4,
+      "trimmed_wake": 1664,
+      "kept": 952
+    },
+    {
+      "id": 30,
+      "psg": "SC4152E0-PSG.edf",
+      "hypnogram": "SC4152EC-Hypnogram.edf",
+      "subject": 15,
+      "night": 2,
+      "grid_epochs": 2864,
+      "unscored": 5,
+      "trimmed_wake": 1097,
+      "kept": 1762
+    },
+    {
+      "id": 31,
+      "psg": "SC4161E0-PSG.edf",
+      "hypnogram": "SC4161EC-Hypnogram.edf",
+      "subject": 16,
+      "night": 1,
+      "grid_epochs": 2626,
+      "unscored": 5,
+      "trimmed_wake": 1477,
+      "kept": 1144
+    },
+    {
+      "id": 32,
+      "psg": "SC4162E0-PSG.edf",
+      "hypnogram": "SC4162EC-Hypnogram.edf",
+      "subject": 16,
+      "night": 2,
+      "grid_epochs": 2752,
+      "unscored": 2,
+      "trimmed_wake": 1747,
+      "kept": 1003
+    },
+    {
+      "id": 33,
+      "psg": "SC4171E0-PSG.edf",
+      "hypnogram": "SC4171EU-Hypnogram.edf",
+      "subject": 17,
+      "night": 1,
+      "grid_epochs": 2742,
+      "unscored": 1,
+      "trimmed_wake": 1739,
+      "kept": 1002
+    },
+    {
+      "id": 34,
+      "psg": "SC4172E0-PSG.edf",
+      "hypnogram": "SC4172EC-Hypnogram.edf",
+      "subject": 17,
+      "night": 2,
+      "grid_epochs": 2724,
+      "unscored": 4,
+      "trimmed_wake": 947,
+      "kept": 1773
+    },
+    {
+      "id": 35,
+      "psg": "SC4181E0-PSG.edf",
+      "hypnogram": "SC4181EC-Hypnogram.edf",
+      "subject": 18,
+      "night": 1,
+      "grid_epochs": 2756,
+      "unscored": 0,
+      "trimmed_wake": 1792,
+      "kept": 964
+    },
+    {
+      "id": 36,
+      "psg": "SC4182E0-PSG.edf",
+      "hypnogram": "SC4182EC-Hypnogram.edf",
+      "subject": 18,
+      "night": 2,
+      "grid_epochs": 2842,
+      "unscored": 0,
+      "trimmed_wake": 1922,
+      "kept": 920
+    },
+    {
+      "id": 37,
+      "psg": "SC4191E0-PSG.edf",
+      "hypnogram": "SC4191EP-Hypnogram.edf",
+      "subject": 19,
+      "night": 1,
+      "grid_epochs": 2774,
+      "unscored": 0,
+      "trimmed_wake": 1239,
+      "kept": 1535
+    },
+    {
+      "id": 38,
+      "psg": "SC4192E0-PSG.edf",
+      "hypnogram": "SC4192EV-Hypnogram.edf",
+      "subject": 19,
+      "night": 2,
+      "grid_epochs": 2610,
+      "unscored": 5,
+      "trimmed_wake": 1331,
+      "kept": 1274
+    }
+  ],
+  "folds": [
+    {
+      "train": [
+        0,
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        10,
+        11,
+        12,
+        13,
+        17,
+        18,
+        19
+      ],
+      "val": [
+        1,
+        16
+      ],
+      "test": [
+        7,
+        9,
+        14,
+        15
+      ],
+      "n_train_epochs": 26916,
+      "n_val_epochs": 4436,
+      "n_test_epochs": 8922
+    },
+    {
+      "train": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        7,
+        9,
+        11,
+        14,
+        15,
+        16,
+        17,
+        18
+      ],
+      "val": [
+        8,
+        13
+      ],
+      "test": [
+        6,
+        10,
+        12,
+        19
+      ],
+      "n_train_epochs": 29385,
+      "n_val_epochs": 3046,
+      "n_test_epochs": 7843
+    },
+    {
+      "train": [
+        1,
+        4,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        15,
+        17,
+        18,
+        19
+      ],
+      "val": [
+        2,
+        13
+      ],
+      "test": [
+        0,
+        3,
+        5,
+        16
+      ],
+      "n_train_epochs": 29896,
+      "n_val_epochs": 3062,
+      "n_test_epochs": 7316
+    },
+    {
+      "train": [
+        0,
+        1,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        13,
+        14,
+        15,
+        17,
+        19
+      ],
+      "val": [
+        12,
+        16
+      ],
+      "test": [
+        2,
+        4,
+        11,
+        18
+      ],
+      "n_train_epochs": 28015,
+      "n_val_epochs": 4176,
+      "n_test_epochs": 8083
+    },
+    {
+      "train": [
+        0,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        10,
+        11,
+        12,
+        14,
+        15,
+        16,
+        19
+      ],
+      "val": [
+        9,
+        18
+      ],
+      "test": [
+        1,
+        8,
+        13,
+        17
+      ],
+      "n_train_epochs": 28044,
+      "n_val_epochs": 4120,
+      "n_test_epochs": 8110
+    }
+  ]
 }

@@ -1,30 +1,24 @@
 # Sleep Stage Classification from EEG Signals Using a Lightweight CNN
-# Requirements
+# Tested with: Python 3.13, torch 2.6, mne 1.13, numpy 2.5, scikit-learn 1.7, streamlit 1.49
 
 # Deep Learning
-torch>=2.0.0
-torchvision>=0.15.0
+torch>=2.4,<3
 
 # EEG Processing
-mne>=1.6.0
+mne>=1.6,<2
 
-# Scientific Computing
-numpy>=1.24.0
-scipy>=1.10.0
+# Scientific Computing & Evaluation
+numpy>=1.24,<3
+scikit-learn>=1.3,<2
 
-# Machine Learning & Evaluation
-scikit-learn>=1.3.0
+# Web dashboard backend (React frontend lives in web/)
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
 
-# Dashboard
-streamlit>=1.28.0
+# Legacy Streamlit dashboard
+streamlit>=1.37,<2
+plotly>=5.18,<7
 
-# Visualization
-plotly>=5.18.0
-matplotlib>=3.7.0
-
-# Data Handling
-pandas>=2.0.0
-h5py>=3.9.0
-
-# Utilities
-tqdm>=4.65.0
+# Testing
+pytest>=7
+httpx>=0.27   # FastAPI TestClient
